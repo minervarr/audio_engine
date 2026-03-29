@@ -17,6 +17,7 @@ add_library(usb1 STATIC
 
 target_include_directories(usb1 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/libusb/android
     ${CMAKE_CURRENT_SOURCE_DIR}/libusb/libusb
     ${CMAKE_CURRENT_SOURCE_DIR}/libusb/libusb/os)
 
