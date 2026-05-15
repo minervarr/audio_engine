@@ -1,0 +1,69 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"jsonFile" : "directory-.-RelWithDebInfo-d0094a50bb2071803777.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.10.0"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1
+					]
+				}
+			],
+			"name" : "RelWithDebInfo",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "matrix_audio",
+					"targetIndexes" : 
+					[
+						0,
+						1
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "matrix_audio::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-matrix_audio-RelWithDebInfo-e39ddfd1f95a5ad7c359.json",
+					"name" : "matrix_audio",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "usb1::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-usb1-RelWithDebInfo-1b077513247511da9ec4.json",
+					"name" : "usb1",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "C:/Users/incxiuefb/Documents/Files/clone/media_player/audioengine/.cxx/RelWithDebInfo/52194mo6/armeabi-v7a",
+		"source" : "C:/Users/incxiuefb/Documents/Files/clone/media_player/audioengine/src/main/cpp"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 3
+	}
+}

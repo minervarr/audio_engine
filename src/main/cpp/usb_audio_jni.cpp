@@ -59,6 +59,15 @@ Java_com_nerio_audioengine_UsbAudioNative_nativeConfigure(JNIEnv*, jclass,
 }
 
 JNIEXPORT jboolean JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeConfigureForDsd(JNIEnv*, jclass,
+        jlong handle, jint sampleRate, jint channels, jint bitDepth, jboolean preferDsd) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return JNI_FALSE;
+    return driver->configure(sampleRate, channels, bitDepth, preferDsd == JNI_TRUE)
+            ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
 Java_com_nerio_audioengine_UsbAudioNative_nativeStart(JNIEnv*, jclass, jlong handle) {
     auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
     if (!driver) return JNI_FALSE;
@@ -118,9 +127,42 @@ Java_com_nerio_audioengine_UsbAudioNative_nativeWriteInt16(JNIEnv* env, jclass,
 }
 
 JNIEXPORT jint JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeWriteInt24Packed(JNIEnv* env, jclass,
+        jlong handle, jbyteArray data, jint offset, jint length) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return -1;
+    jbyte* bytes = env->GetByteArrayElements(data, nullptr);
+    if (!bytes) return -1;
+    int consumed = driver->writeInt24Packed(
+            reinterpret_cast<const uint8_t*>(bytes + offset), length);
+    env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
+    return consumed * 3;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeWriteInt32(JNIEnv* env, jclass,
+        jlong handle, jbyteArray data, jint offset, jint length) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return -1;
+    jbyte* bytes = env->GetByteArrayElements(data, nullptr);
+    if (!bytes) return -1;
+    int numSamples = length / 4;
+    const int32_t* samples = reinterpret_cast<const int32_t*>(bytes + offset);
+    int consumed = driver->writeInt32(samples, numSamples);
+    env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
+    return consumed * 4;
+}
+
+JNIEXPORT jint JNICALL
 Java_com_nerio_audioengine_UsbAudioNative_nativeGetConfiguredBitDepth(JNIEnv*, jclass, jlong handle) {
     auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
     return driver ? driver->getConfiguredBitDepth() : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetConfiguredSubslotSize(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    return driver ? driver->getConfiguredSubslotSize() : 0;
 }
 
 JNIEXPORT jint JNICALL
@@ -161,6 +203,53 @@ Java_com_nerio_audioengine_UsbAudioNative_nativeClose(JNIEnv*, jclass, jlong han
             activeDriver = nullptr;
         }
     }
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeHasHardwareVolume(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    return (driver && driver->hasHardwareVolume()) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeHasHardwareMute(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    return (driver && driver->hasHardwareMute()) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetVolumeMinDbQ8(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    return driver ? driver->getVolumeMinDbQ8() : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetVolumeMaxDbQ8(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    return driver ? driver->getVolumeMaxDbQ8() : 0;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeSetHardwareVolumeDbQ8(JNIEnv*, jclass,
+        jlong handle, jint valueDbQ8) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return JNI_FALSE;
+    return driver->setHwVolumeDbQ8((int)valueDbQ8) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeSetHardwareMute(JNIEnv*, jclass,
+        jlong handle, jboolean muted) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return JNI_FALSE;
+    return driver->setHwMute(muted == JNI_TRUE) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeSetSoftwareGain(JNIEnv*, jclass,
+        jlong handle, jfloat gain) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (driver) driver->setSoftwareGain((float)gain);
 }
 
 } // extern "C"

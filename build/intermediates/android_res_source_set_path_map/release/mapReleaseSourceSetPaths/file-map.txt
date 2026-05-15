@@ -1,0 +1,7 @@
+com.nerio.audioengine-pngs-0 C:\Users\incxiuefb\Documents\Files\clone\media_player\audioengine\build\generated\res\pngs\release
+com.nerio.audioengine-updated_navigation_xml-1 C:\Users\incxiuefb\Documents\Files\clone\media_player\audioengine\build\generated\updated_navigation_xml\release
+com.nerio.audioengine-mergeReleaseResources-2 C:\Users\incxiuefb\Documents\Files\clone\media_player\audioengine\build\intermediates\incremental\release\mergeReleaseResources\merged.dir
+com.nerio.audioengine-mergeReleaseResources-3 C:\Users\incxiuefb\Documents\Files\clone\media_player\audioengine\build\intermediates\incremental\release\mergeReleaseResources\stripped.dir
+com.nerio.audioengine-release-4 C:\Users\incxiuefb\Documents\Files\clone\media_player\audioengine\build\intermediates\merged_res\release\mergeReleaseResources
+com.nerio.audioengine-main-5 C:\Users\incxiuefb\Documents\Files\clone\media_player\audioengine\src\main\res
+com.nerio.audioengine-release-6 C:\Users\incxiuefb\Documents\Files\clone\media_player\audioengine\src\release\res

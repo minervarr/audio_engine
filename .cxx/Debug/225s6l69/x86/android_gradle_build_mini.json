@@ -1,0 +1,33 @@
+{
+  "buildFiles": [
+    "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\src\\main\\cpp\\CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "C:\\PPProgam\\android_sdk\\cmake\\3.22.1\\bin\\ninja.exe",
+      "-C",
+      "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\.cxx\\Debug\\225s6l69\\x86",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "C:\\PPProgam\\android_sdk\\cmake\\3.22.1\\bin\\ninja.exe",
+    "-C",
+    "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\.cxx\\Debug\\225s6l69\\x86",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "matrix_audio::@6890427a1f51a3e7e1df": {
+      "artifactName": "matrix_audio",
+      "abi": "x86",
+      "output": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\build\\intermediates\\cxx\\Debug\\225s6l69\\obj\\x86\\libmatrix_audio.so",
+      "runtimeFiles": []
+    },
+    "usb1::@6890427a1f51a3e7e1df": {
+      "artifactName": "usb1",
+      "abi": "x86",
+      "output": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\.cxx\\Debug\\225s6l69\\x86\\libusb1.a",
+      "runtimeFiles": []
+    }
+  }
+}

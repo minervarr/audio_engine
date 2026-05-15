@@ -39,8 +39,13 @@ struct libusb_transfer;
 // Audio Class-Specific Request Codes
 #define UAC_SET_CUR             0x01
 #define UAC_GET_CUR             0x81
+#define UAC2_RANGE              0x02
 #define UAC2_CS_CONTROL_SAM_FREQ 0x01
 #define UAC2_CS_CONTROL_CLOCK_VALID 0x02
+
+// Feature Unit control selectors (used in wValue high byte for GET/SET CUR)
+#define UAC_FU_MUTE_CONTROL     0x01
+#define UAC_FU_VOLUME_CONTROL   0x02
 
 // Format type codes
 #define UAC_FORMAT_TYPE_I       0x01
@@ -121,8 +126,12 @@ struct UsbAudioFormat {
     int maxPacketSize;
     int sampleRate;
     int channels;
-    int bitDepth;
+    int bitDepth;       // bBitResolution: number of significant bits per sample
+    int subslotSize;    // bSubslotSize: bytes on the wire per sample (>= bitDepth/8)
+    uint32_t bmFormats = 0;  // UAC2 AS_GENERAL bmFormats bitmap (bit 31 = RAW_DATA / DSD)
+    bool isDsd = false;      // True when this alt-setting is the DSD variant
     int feedbackEpAddr = -1;
+    int clockSourceId = -1;  // Resolved via AS_GENERAL.bTerminalLink -> Terminal.bCSourceID
 };
 
 class UsbAudioDriver {
@@ -133,11 +142,13 @@ public:
     bool open(int fd);
     bool parseDescriptors();
     std::vector<int> getSupportedRates();
-    bool configure(int sampleRate, int channels, int bitDepth);
+    bool configure(int sampleRate, int channels, int bitDepth, bool preferDsd = false);
     bool start();
     int write(const uint8_t* data, int length);
     int writeFloat32(const float* data, int numSamples);
     int writeInt16(const int16_t* data, int numSamples);
+    int writeInt24Packed(const uint8_t* data, int numBytes);
+    int writeInt32(const int32_t* data, int numSamples);
     void flush();
     void stop();
     void close();
@@ -145,13 +156,27 @@ public:
     int getConfiguredRate() const { return configuredRate; }
     int getConfiguredChannels() const { return configuredChannels; }
     int getConfiguredBitDepth() const { return configuredBitDepth; }
+    int getConfiguredSubslotSize() const { return configuredSubslotSize; }
     int getUacVersion() const { return uacVersion; }
     std::string getDeviceInfo() const;
+
+    // Volume control. Hardware path drives the UAC Feature Unit's volume/mute
+    // controls; software path multiplies samples in writeFloat32/writeInt16.
+    bool hasHardwareVolume() const { return volumeFuUnitId >= 0; }
+    bool hasHardwareMute() const { return hasFuMute; }
+    int getVolumeMinDbQ8() const { return volumeMinDbQ8; }
+    int getVolumeMaxDbQ8() const { return volumeMaxDbQ8; }
+    int getVolumeResDbQ8() const { return volumeResDbQ8; }
+    bool setHwVolumeDbQ8(int valueDbQ8);
+    bool setHwMute(bool muted);
+    void setSoftwareGain(float gain) { softwareGain.store(gain, std::memory_order_relaxed); }
 
 private:
     bool setInterfaceAltSetting(int interface_num, int alt_setting);
     bool setSampleRate(int endpoint, int rate);
     bool setSampleRateUAC2(int clockId, int rate);
+    std::vector<int> queryUac2SampleRates(int clockId);
+    bool queryHwVolumeRange();
     void submitTransfer(int index);
     static void transferCallback(struct libusb_transfer* transfer);
     void handleTransferComplete(struct libusb_transfer* transfer);
@@ -169,10 +194,20 @@ private:
     int configuredRate = 0;
     int configuredChannels = 0;
     int configuredBitDepth = 0;
+    int configuredSubslotSize = 0;
     int uacVersion = 1;
     int clockSourceId = -1;
     int acInterfaceNum = 0;
     int usbSpeed = 0;
+
+    // Volume / Feature Unit state. -1 unitId == no hardware volume detected.
+    // Q8.8 signed dB on the UAC2 wire (UAC1 SLR/LR widely used as Q8.8 too).
+    int volumeFuUnitId = -1;
+    bool hasFuMute = false;
+    int16_t volumeMinDbQ8 = -8000;  // -32 dB default until queried
+    int16_t volumeMaxDbQ8 = 0;
+    int16_t volumeResDbQ8 = 256;    // 1 dB step default
+    std::atomic<float> softwareGain{1.0f};
 
     // Isochronous transfer ring
     static const int NUM_TRANSFERS = 8;

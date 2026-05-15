@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <unordered_map>
 #include <thread>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -76,7 +77,21 @@ bool UsbAudioDriver::parseDescriptors() {
         return false;
     }
 
-    // Pass 1: Find Audio Control interface, detect UAC version & clock source
+    // Pass 1: Find Audio Control interface, detect UAC version, enumerate clock
+    // sources, and build a terminal -> clock-source ID map. Devices that are both
+    // a DAC and an ADC have two clock sources (one per direction) -- without the
+    // terminal-link chain we can't tell which clock to query for which alt-setting.
+    // We also collect Feature Units here so we can pick the playback-chain FU
+    // for hardware volume control.
+    std::vector<int> clockSourceIds;
+    std::unordered_map<int, int> terminalToClock;
+    // Terminal IDs whose wTerminalType == 0x0101 (USB streaming) coming IN
+    // to the audio function -- i.e., the playback-path entry points.
+    std::unordered_map<int, bool> isUsbStreamingIT;
+    struct FuCandidate { int unitId; int sourceId; bool hasVolume; bool hasMute; };
+    std::vector<FuCandidate> featureUnits;
+    volumeFuUnitId = -1;
+    hasFuMute = false;
     for (int i = 0; i < config->bNumInterfaces; i++) {
         const struct libusb_interface& iface = config->interface[i];
         for (int a = 0; a < iface.num_altsetting; a++) {
@@ -106,13 +121,111 @@ bool UsbAudioDriver::parseDescriptors() {
                     }
                     // UAC2 Clock Source descriptor
                     if (uacVersion == 2 && subType == UAC_CLOCK_SOURCE && descLen >= 5) {
-                        clockSourceId = extra[pos + 3];
-                        LOGI("UAC2 Clock Source ID: %d", clockSourceId);
+                        int csId = extra[pos + 3];
+                        if (clockSourceId < 0) clockSourceId = csId;  // first wins for legacy paths
+                        if (std::find(clockSourceIds.begin(), clockSourceIds.end(), csId)
+                                == clockSourceIds.end()) {
+                            clockSourceIds.push_back(csId);
+                        }
+                        LOGI("UAC2 Clock Source ID: %d", csId);
+                    }
+                    // UAC2 Input Terminal (data flowing INTO audio function): bCSourceID at offset 7
+                    if (uacVersion == 2 && subType == UAC_INPUT_TERMINAL && descLen >= 8) {
+                        int termId = extra[pos + 3];
+                        int termType = extra[pos + 4] | (extra[pos + 5] << 8);
+                        int csId = extra[pos + 7];
+                        terminalToClock[termId] = csId;
+                        // 0x0101 = USB streaming -> playback entry point.
+                        if (termType == 0x0101) isUsbStreamingIT[termId] = true;
+                        LOGI("UAC2 Input Terminal %d (type 0x%04x) -> Clock %d", termId, termType, csId);
+                    }
+                    // UAC2 Output Terminal (data flowing OUT of audio function): bCSourceID at offset 8
+                    if (uacVersion == 2 && subType == UAC_OUTPUT_TERMINAL && descLen >= 9) {
+                        int termId = extra[pos + 3];
+                        int csId = extra[pos + 8];
+                        terminalToClock[termId] = csId;
+                        LOGI("UAC2 Output Terminal %d -> Clock %d", termId, csId);
+                    }
+                    // UAC2 Feature Unit: layout [3]=bUnitID [4]=bSourceID
+                    // [5..]=bmaControls[N+1] (4 bytes per channel, master first).
+                    // Master controls live at offset 5..8 little-endian.
+                    if (uacVersion == 2 && subType == UAC_FEATURE_UNIT && descLen >= 11) {
+                        FuCandidate fu{};
+                        fu.unitId = extra[pos + 3];
+                        fu.sourceId = extra[pos + 4];
+                        uint32_t masterCtrls = (uint32_t)extra[pos + 5]
+                                             | ((uint32_t)extra[pos + 6] << 8)
+                                             | ((uint32_t)extra[pos + 7] << 16)
+                                             | ((uint32_t)extra[pos + 8] << 24);
+                        // bits[1:0]=mute, bits[3:2]=volume. !=0 means present.
+                        fu.hasMute = ((masterCtrls >> 0) & 0x3) != 0;
+                        fu.hasVolume = ((masterCtrls >> 2) & 0x3) != 0;
+                        featureUnits.push_back(fu);
+                        LOGI("UAC2 Feature Unit %d <- src %d ctrls=0x%08x vol=%d mute=%d",
+                             fu.unitId, fu.sourceId, masterCtrls, fu.hasVolume, fu.hasMute);
+                    }
+                    // UAC1 Feature Unit: layout [3]=bUnitID [4]=bSourceID
+                    // [5]=bControlSize [6..]=bmaControls[N+1] (bControlSize bytes each).
+                    // Master is the first entry. bit 0=mute, bit 1=volume.
+                    if (uacVersion < 2 && subType == UAC_FEATURE_UNIT && descLen >= 7) {
+                        FuCandidate fu{};
+                        fu.unitId = extra[pos + 3];
+                        fu.sourceId = extra[pos + 4];
+                        int ctrlSize = extra[pos + 5];
+                        if (ctrlSize >= 1 && descLen >= 6 + ctrlSize) {
+                            uint8_t masterCtrls = extra[pos + 6];
+                            fu.hasMute = (masterCtrls & 0x01) != 0;
+                            fu.hasVolume = (masterCtrls & 0x02) != 0;
+                        }
+                        featureUnits.push_back(fu);
+                        LOGI("UAC1 Feature Unit %d <- src %d vol=%d mute=%d",
+                             fu.unitId, fu.sourceId, fu.hasVolume, fu.hasMute);
                     }
                 }
                 pos += descLen;
             }
         }
+    }
+
+    // Pass 1.5: UAC2 only -- query every clock source we found. Each can have
+    // a different rate range (e.g., DAC clock 44.1k..384k, ADC clock 44.1k..96k).
+    // Cache results per clock so pass 2 can pick the right list per alt-setting.
+    std::unordered_map<int, std::vector<int>> clockRates;
+    if (uacVersion >= 2) {
+        for (int csId : clockSourceIds) {
+            clockRates[csId] = queryUac2SampleRates(csId);
+        }
+    }
+
+    // Pick the best Feature Unit for hardware volume. Prefer FUs whose source
+    // chain is rooted at a USB-streaming Input Terminal (the playback path).
+    // Fall back to any FU with volume on master. DAC+ADC devices have an FU
+    // per direction; this prefers the playback one.
+    for (auto& fu : featureUnits) {
+        if (!fu.hasVolume) continue;
+        if (isUsbStreamingIT.count(fu.sourceId)) {
+            volumeFuUnitId = fu.unitId;
+            hasFuMute = fu.hasMute;
+            break;
+        }
+    }
+    if (volumeFuUnitId < 0) {
+        // No FU directly fed by a USB-streaming IT. Could be chained through
+        // a Selector/Mixer unit -- take the first FU with volume on master.
+        for (auto& fu : featureUnits) {
+            if (fu.hasVolume) {
+                volumeFuUnitId = fu.unitId;
+                hasFuMute = fu.hasMute;
+                break;
+            }
+        }
+    }
+    if (volumeFuUnitId >= 0) {
+        LOGI("Selected Feature Unit %d for hardware volume (mute=%d)",
+             volumeFuUnitId, hasFuMute);
+        queryHwVolumeRange();
+    } else {
+        LOGI("No usable Feature Unit with FU_VOLUME found -- software gain only");
     }
 
     // Pass 2: Find Audio Streaming interfaces
@@ -149,6 +262,9 @@ bool UsbAudioDriver::parseDescriptors() {
             // Parse class-specific AS descriptors for format info
             int channels = 2;
             int bitDepth = 16;
+            int subslotSize = 0;  // 0 = not parsed, will default to bitDepth/8 later
+            uint32_t bmFormats = 0;  // UAC2 AS_GENERAL bmFormats (bit 31 = RAW_DATA / DSD)
+            int bTerminalLink = 0;   // UAC2 AS_GENERAL.bTerminalLink -> terminalToClock lookup
             std::vector<int> rates;
 
             const uint8_t* extra = alt.extra;
@@ -169,17 +285,26 @@ bool UsbAudioDriver::parseDescriptors() {
                         //         [3]=bTerminalLink [4]=bmControls [5]=bFormatType
                         //         [6..9]=bmFormats [10]=bNrChannels
                         if (subType == UAC_AS_GENERAL && descLen >= 16) {
+                            bTerminalLink = extra[pos + 3];
                             channels = extra[pos + 10];
+                            bmFormats = (uint32_t)extra[pos + 6]
+                                      | ((uint32_t)extra[pos + 7] << 8)
+                                      | ((uint32_t)extra[pos + 8] << 16)
+                                      | ((uint32_t)extra[pos + 9] << 24);
                         }
-                        // UAC2 FORMAT_TYPE: bBitResolution at offset 5
+                        // UAC2 FORMAT_TYPE: bSubslotSize at offset 4, bBitResolution at offset 5
                         if (subType == UAC_FORMAT_TYPE && descLen >= 6) {
+                            subslotSize = extra[pos + 4];
                             bitDepth = extra[pos + 5];
                         }
                     } else {
                         // UAC1 FORMAT_TYPE descriptor
+                        // Layout: [3]=bFormatType [4]=bNrChannels [5]=bSubFrameSize
+                        //         [6]=bBitResolution [7]=bSamFreqType ...
                         if (subType == UAC_FORMAT_TYPE && descLen >= 8) {
                             if (extra[pos + 3] == UAC_FORMAT_TYPE_I) {
                                 channels = extra[pos + 4];
+                                subslotSize = extra[pos + 5];
                                 bitDepth = extra[pos + 6];
                                 int numRates = extra[pos + 7];
                                 if (numRates == 0 && descLen >= 14) {
@@ -204,9 +329,37 @@ bool UsbAudioDriver::parseDescriptors() {
                 pos += descLen;
             }
 
-            if (rates.empty()) {
-                rates = {44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000};
+            // Resolve which clock source serves this alt-setting.
+            // AS_GENERAL.bTerminalLink -> terminalToClock map. Fall back to the
+            // first clock found (legacy single-clock devices).
+            int resolvedClockId = -1;
+            if (uacVersion >= 2 && bTerminalLink > 0) {
+                auto it = terminalToClock.find(bTerminalLink);
+                if (it != terminalToClock.end()) resolvedClockId = it->second;
             }
+            if (resolvedClockId < 0) resolvedClockId = clockSourceId;
+
+            if (rates.empty()) {
+                // Prefer rates for this alt's own clock source. On DAC+ADC devices
+                // this keeps the ADC's lower ceiling from leaking into playback.
+                if (resolvedClockId >= 0) {
+                    auto it = clockRates.find(resolvedClockId);
+                    if (it != clockRates.end() && !it->second.empty()) {
+                        rates = it->second;
+                    }
+                }
+                if (rates.empty()) {
+                    // Conservative fallback. High rates (705.6k/768k) ONLY enter
+                    // via a successful UAC2 GET RANGE -- otherwise we'd be
+                    // claiming capabilities the DAC may not have, and start()
+                    // could ship isochronous data at an un-acked rate (noise).
+                    rates = {44100, 48000, 88200, 96000, 176400, 192000,
+                             352800, 384000};
+                }
+            }
+
+            // Fall back if subslot wasn't parsed (older/malformed descriptors)
+            int effectiveSubslot = (subslotSize > 0) ? subslotSize : ((bitDepth + 7) / 8);
 
             for (int rate : rates) {
                 UsbAudioFormat fmt{};
@@ -217,7 +370,11 @@ bool UsbAudioDriver::parseDescriptors() {
                 fmt.sampleRate = rate;
                 fmt.channels = channels;
                 fmt.bitDepth = bitDepth;
+                fmt.subslotSize = effectiveSubslot;
+                fmt.bmFormats = bmFormats;
+                fmt.isDsd = (bmFormats & 0x80000000u) != 0;
                 fmt.feedbackEpAddr = feedbackEp;
+                fmt.clockSourceId = resolvedClockId;
                 formats.push_back(fmt);
             }
         }
@@ -225,11 +382,38 @@ bool UsbAudioDriver::parseDescriptors() {
 
     libusb_free_config_descriptor(config);
 
+    // Duplicate-alt heuristic: some DACs expose two alt-settings with identical
+    // (rate, channels, bitDepth) but don't set the RAW_DATA bit in bmFormats.
+    // When that happens, assume the higher-numbered alt is the DSD one.
+    for (auto& f : formats) {
+        if (f.isDsd) continue;
+        bool dsdAlreadyInGroup = false;
+        UsbAudioFormat* higher = nullptr;
+        for (auto& g : formats) {
+            if (&g == &f) continue;
+            if (g.sampleRate != f.sampleRate) continue;
+            if (g.channels != f.channels) continue;
+            if (g.bitDepth != f.bitDepth) continue;
+            if (g.isDsd) { dsdAlreadyInGroup = true; break; }
+            if (g.altSetting > f.altSetting && (!higher || g.altSetting > higher->altSetting)) {
+                higher = &g;
+            }
+        }
+        if (dsdAlreadyInGroup || !higher) continue;
+        if (!higher->isDsd) {
+            higher->isDsd = true;
+            LOGI("heuristic: marked alt=%d (rate=%d ch=%d bits=%d) as DSD candidate",
+                 higher->altSetting, higher->sampleRate, higher->channels, higher->bitDepth);
+        }
+    }
+
     LOGI("Parsed %zu format(s), UAC%d", formats.size(), uacVersion);
     for (auto& f : formats) {
-        LOGI("  iface=%d alt=%d ep=0x%02x rate=%d ch=%d bits=%d maxpkt=0x%04x fb=0x%02x",
+        LOGI("  iface=%d alt=%d ep=0x%02x rate=%d ch=%d bits=%d subslot=%d bmFormats=0x%08x dsd=%d clk=%d maxpkt=0x%04x fb=0x%02x",
              f.interfaceNum, f.altSetting, f.endpointAddr,
-             f.sampleRate, f.channels, f.bitDepth, f.maxPacketSize, f.feedbackEpAddr);
+             f.sampleRate, f.channels, f.bitDepth, f.subslotSize,
+             f.bmFormats, f.isDsd ? 1 : 0, f.clockSourceId,
+             f.maxPacketSize, f.feedbackEpAddr);
     }
 
     return !formats.empty();
@@ -328,7 +512,203 @@ bool UsbAudioDriver::setSampleRateUAC2(int clockId, int rate) {
     return true;
 }
 
-bool UsbAudioDriver::configure(int sampleRate, int channels, int bitDepth) {
+bool UsbAudioDriver::queryHwVolumeRange() {
+    if (!handle || volumeFuUnitId < 0) return false;
+
+    // UAC2 GET RANGE on FU_VOLUME_CONTROL, master channel.
+    // Response: wNumSubRanges (2 bytes) + N * (wMIN, wMAX, wRES) each 2 bytes Q8.8 dB.
+    const uint8_t bmRequest = LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_CLASS
+                            | LIBUSB_RECIPIENT_INTERFACE;
+    const uint8_t bRequest = UAC2_RANGE;
+    const uint16_t wValue = (UAC_FU_VOLUME_CONTROL << 8) | 0;  // master channel
+    const uint16_t wIndex = (uint16_t)((volumeFuUnitId << 8) | acInterfaceNum);
+
+    bool tempClaim = false;
+    if (acInterfaceNum >= 0 && !acInterfaceClaimed) {
+        if (libusb_claim_interface(handle, acInterfaceNum) == 0) tempClaim = true;
+    }
+
+    if (uacVersion >= 2) {
+        uint8_t header[2] = {0, 0};
+        int rc = libusb_control_transfer(handle, bmRequest, bRequest, wValue, wIndex,
+                                         header, sizeof(header), 1000);
+        if (rc < 2) {
+            LOGI("FU volume GET_RANGE header read failed (rc=%d), using defaults", rc);
+            if (tempClaim) libusb_release_interface(handle, acInterfaceNum);
+            return false;
+        }
+        uint16_t n = (uint16_t)header[0] | ((uint16_t)header[1] << 8);
+        if (n == 0) {
+            if (tempClaim) libusb_release_interface(handle, acInterfaceNum);
+            return false;
+        }
+        int totalLen = 2 + (int)n * 6;
+        std::vector<uint8_t> buf(totalLen, 0);
+        rc = libusb_control_transfer(handle, bmRequest, bRequest, wValue, wIndex,
+                                     buf.data(), (uint16_t)totalLen, 1000);
+        if (rc < totalLen) {
+            LOGI("FU volume GET_RANGE full read short (rc=%d expected=%d)", rc, totalLen);
+            if (tempClaim) libusb_release_interface(handle, acInterfaceNum);
+            return false;
+        }
+        // Take the widest range across all sub-ranges (most DACs report one).
+        int16_t minDb = 32767, maxDb = -32768;
+        uint16_t res = 256;
+        for (int i = 0; i < n; i++) {
+            int off = 2 + i * 6;
+            int16_t mn = (int16_t)(buf[off]     | ((uint16_t)buf[off + 1] << 8));
+            int16_t mx = (int16_t)(buf[off + 2] | ((uint16_t)buf[off + 3] << 8));
+            uint16_t rs = (uint16_t)(buf[off + 4] | ((uint16_t)buf[off + 5] << 8));
+            if (mn < minDb) minDb = mn;
+            if (mx > maxDb) maxDb = mx;
+            if (rs > 0) res = rs;
+        }
+        volumeMinDbQ8 = minDb;
+        volumeMaxDbQ8 = maxDb;
+        volumeResDbQ8 = (int16_t)res;
+        LOGI("FU volume range: min=%.2f dB max=%.2f dB res=%.2f dB",
+             volumeMinDbQ8 / 256.0f, volumeMaxDbQ8 / 256.0f, volumeResDbQ8 / 256.0f);
+    }
+    // UAC1: would require three separate GET_MIN/MAX/RES queries. Keep defaults
+    // for UAC1 (-32 dB .. 0 dB, 1 dB step); good enough for SET_CUR to work.
+
+    if (tempClaim) libusb_release_interface(handle, acInterfaceNum);
+    return true;
+}
+
+bool UsbAudioDriver::setHwVolumeDbQ8(int valueDbQ8) {
+    if (!handle || volumeFuUnitId < 0) return false;
+    // Clamp to declared range.
+    if (valueDbQ8 < volumeMinDbQ8) valueDbQ8 = volumeMinDbQ8;
+    if (valueDbQ8 > volumeMaxDbQ8) valueDbQ8 = volumeMaxDbQ8;
+
+    int16_t v = (int16_t)valueDbQ8;
+    uint8_t data[2] = { (uint8_t)(v & 0xFF), (uint8_t)((v >> 8) & 0xFF) };
+
+    const uint16_t wValue = (UAC_FU_VOLUME_CONTROL << 8) | 0;
+    const uint16_t wIndex = (uint16_t)((volumeFuUnitId << 8) | acInterfaceNum);
+
+    int rc = libusb_control_transfer(handle,
+        LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_INTERFACE,
+        UAC_SET_CUR, wValue, wIndex, data, sizeof(data), 1000);
+    if (rc < 0) {
+        LOGE("setHwVolumeDbQ8(%d) failed: %s", valueDbQ8, libusb_error_name(rc));
+        return false;
+    }
+    return true;
+}
+
+bool UsbAudioDriver::setHwMute(bool muted) {
+    if (!handle || volumeFuUnitId < 0 || !hasFuMute) return false;
+    uint8_t data[1] = { (uint8_t)(muted ? 1 : 0) };
+
+    const uint16_t wValue = (UAC_FU_MUTE_CONTROL << 8) | 0;
+    const uint16_t wIndex = (uint16_t)((volumeFuUnitId << 8) | acInterfaceNum);
+
+    int rc = libusb_control_transfer(handle,
+        LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_INTERFACE,
+        UAC_SET_CUR, wValue, wIndex, data, sizeof(data), 1000);
+    if (rc < 0) {
+        LOGE("setHwMute(%d) failed: %s", muted, libusb_error_name(rc));
+        return false;
+    }
+    return true;
+}
+
+std::vector<int> UsbAudioDriver::queryUac2SampleRates(int clockId) {
+    // UAC2 GET RANGE on CS_SAM_FREQ_CONTROL of the clock source unit.
+    // Response: wNumSubRanges (2 bytes) followed by N * (dMIN, dMAX, dRES) of 4
+    // bytes each (12 bytes per sub-range). All values little-endian.
+    std::vector<int> result;
+    if (!handle) return result;
+
+    const uint8_t bmRequest = LIBUSB_ENDPOINT_IN
+                            | LIBUSB_REQUEST_TYPE_CLASS
+                            | LIBUSB_RECIPIENT_INTERFACE;
+    const uint8_t bRequest = 0x02;  // RANGE
+    const uint16_t wValue = (UAC2_CS_CONTROL_SAM_FREQ << 8);
+    const uint16_t wIndex = (uint16_t)((clockId << 8) | acInterfaceNum);
+
+    // Some Android USB stacks require the AC interface to be claimed before
+    // accepting class-specific control transfers to it. Claim here, release
+    // after; start() will re-claim later.
+    bool tempClaim = false;
+    if (acInterfaceNum >= 0 && !acInterfaceClaimed) {
+        if (libusb_claim_interface(handle, acInterfaceNum) == 0) {
+            tempClaim = true;
+        }
+    }
+
+    // First read: 2-byte header to learn wNumSubRanges.
+    uint8_t header[2] = {0, 0};
+    int rc = libusb_control_transfer(handle, bmRequest, bRequest, wValue, wIndex,
+                                     header, sizeof(header), 1000);
+    if (rc < 2) {
+        LOGI("UAC2 GET RANGE header read failed (rc=%d), falling back to hardcoded rates",
+             rc);
+        if (tempClaim) libusb_release_interface(handle, acInterfaceNum);
+        return result;
+    }
+    uint16_t numSubRanges = (uint16_t)header[0] | ((uint16_t)header[1] << 8);
+    if (numSubRanges == 0) {
+        LOGI("UAC2 GET RANGE: zero sub-ranges reported");
+        if (tempClaim) libusb_release_interface(handle, acInterfaceNum);
+        return result;
+    }
+
+    int totalLen = 2 + (int)numSubRanges * 12;
+    std::vector<uint8_t> buf(totalLen, 0);
+    rc = libusb_control_transfer(handle, bmRequest, bRequest, wValue, wIndex,
+                                 buf.data(), (uint16_t)totalLen, 1000);
+    if (rc < totalLen) {
+        LOGI("UAC2 GET RANGE full read short (rc=%d expected=%d)", rc, totalLen);
+        if (tempClaim) libusb_release_interface(handle, acInterfaceNum);
+        return result;
+    }
+
+    LOGI("UAC2 Clock %d: %d sub-range(s)", clockId, (int)numSubRanges);
+    const int commonRates[] = {44100, 48000, 88200, 96000, 176400, 192000,
+                               352800, 384000, 705600, 768000};
+    for (int i = 0; i < numSubRanges; i++) {
+        int off = 2 + i * 12;
+        uint32_t dMin = (uint32_t)buf[off]
+                      | ((uint32_t)buf[off + 1] << 8)
+                      | ((uint32_t)buf[off + 2] << 16)
+                      | ((uint32_t)buf[off + 3] << 24);
+        uint32_t dMax = (uint32_t)buf[off + 4]
+                      | ((uint32_t)buf[off + 5] << 8)
+                      | ((uint32_t)buf[off + 6] << 16)
+                      | ((uint32_t)buf[off + 7] << 24);
+        uint32_t dRes = (uint32_t)buf[off + 8]
+                      | ((uint32_t)buf[off + 9] << 8)
+                      | ((uint32_t)buf[off + 10] << 16)
+                      | ((uint32_t)buf[off + 11] << 24);
+        LOGI("  sub-range %d: min=%u max=%u res=%u", i, dMin, dMax, dRes);
+
+        if (dMin == dMax) {
+            // Singleton sub-range: a single discrete fixed rate.
+            result.push_back((int)dMin);
+        } else {
+            // Range (continuous when dRes==0, stepped otherwise). In both
+            // cases enumerate the standard audiophile rates that fall inside
+            // [dMin, dMax]. We don't filter by dRes alignment because real
+            // DACs step at 1 Hz or implement the standard rates directly.
+            for (int r : commonRates) {
+                if ((uint32_t)r >= dMin && (uint32_t)r <= dMax) {
+                    result.push_back(r);
+                }
+            }
+        }
+    }
+
+    if (tempClaim) libusb_release_interface(handle, acInterfaceNum);
+
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
+bool UsbAudioDriver::configure(int sampleRate, int channels, int bitDepth, bool preferDsd) {
     if (!opened) {
         LOGE("configure() called but not opened");
         return false;
@@ -340,14 +720,26 @@ bool UsbAudioDriver::configure(int sampleRate, int channels, int bitDepth) {
         stop();
     }
 
-    LOGI("configure requested: rate=%d ch=%d bits=%d", sampleRate, channels, bitDepth);
+    LOGI("configure requested: rate=%d ch=%d bits=%d preferDsd=%d",
+         sampleRate, channels, bitDepth, preferDsd ? 1 : 0);
 
-    // Find best matching format
+    // Pass 1: exact match including DSD preference. When preferDsd is true we
+    // only accept a DSD-flagged alt; when false we only accept a non-DSD alt.
     UsbAudioFormat* best = nullptr;
     for (auto& f : formats) {
-        if (f.sampleRate == sampleRate && f.channels == channels && f.bitDepth == bitDepth) {
+        if (f.sampleRate == sampleRate && f.channels == channels && f.bitDepth == bitDepth
+                && f.isDsd == preferDsd) {
             best = &f;
             break;
+        }
+    }
+    // Pass 2: exact match on (rate, channels, bits) ignoring DSD flag.
+    if (!best) {
+        for (auto& f : formats) {
+            if (f.sampleRate == sampleRate && f.channels == channels && f.bitDepth == bitDepth) {
+                best = &f;
+                break;
+            }
         }
     }
     // Relax: match rate, prefer highest bit depth
@@ -364,15 +756,20 @@ bool UsbAudioDriver::configure(int sampleRate, int channels, int bitDepth) {
         LOGE("No matching format for rate=%d ch=%d bits=%d", sampleRate, channels, bitDepth);
         return false;
     }
+    LOGI("Selected alt=%d (isDsd=%d) for rate=%d ch=%d bits=%d",
+         best->altSetting, best->isDsd ? 1 : 0,
+         best->sampleRate, best->channels, best->bitDepth);
 
     activeFormat = *best;
     configuredRate = sampleRate;
     configuredChannels = best->channels;
     configuredBitDepth = best->bitDepth;
+    configuredSubslotSize = (best->subslotSize > 0)
+            ? best->subslotSize : ((best->bitDepth + 7) / 8);
     configured = true;
 
-    LOGI("Configured: rate=%d ch=%d bits=%d iface=%d alt=%d ep=0x%02x UAC%d",
-         configuredRate, configuredChannels, configuredBitDepth,
+    LOGI("Configured: rate=%d ch=%d bits=%d subslot=%d iface=%d alt=%d ep=0x%02x UAC%d",
+         configuredRate, configuredChannels, configuredBitDepth, configuredSubslotSize,
          activeFormat.interfaceNum, activeFormat.altSetting,
          activeFormat.endpointAddr, uacVersion);
     return true;
@@ -428,7 +825,7 @@ void UsbAudioDriver::submitTransfer(int index) {
     if (!streaming.load()) return;
 
     libusb_transfer* xfr = transfers[index];
-    int bytesPerFrame = (configuredBitDepth / 8) * configuredChannels;
+    int bytesPerFrame = configuredSubslotSize * configuredChannels;
     uint8_t* buf = transferBuffers[index];
 
     // Determine frames per packet, using feedback if available
@@ -558,7 +955,7 @@ bool UsbAudioDriver::start() {
     int effectiveMaxPkt = basePktSize * mult;
 
     bool isHighSpeed = (usbSpeed >= LIBUSB_SPEED_HIGH);
-    int bytesPerFrame = (configuredBitDepth / 8) * configuredChannels;
+    int bytesPerFrame = configuredSubslotSize * configuredChannels;
 
     // Correct frames-per-packet based on USB speed
     int nominalFpp;
@@ -573,15 +970,15 @@ bool UsbAudioDriver::start() {
         bytesPerPacket = effectiveMaxPkt;
     }
 
-    LOGI("Starting: iface=%d alt=%d ep=0x%02x rate=%d ch=%d bits=%d "
+    LOGI("Starting: iface=%d alt=%d ep=0x%02x rate=%d ch=%d bits=%d subslot=%d "
          "maxpkt=0x%04x(eff=%d) speed=%s fpp=%d bpp=%d UAC%d",
          activeFormat.interfaceNum, activeFormat.altSetting, activeFormat.endpointAddr,
-         configuredRate, configuredChannels, configuredBitDepth,
+         configuredRate, configuredChannels, configuredBitDepth, configuredSubslotSize,
          activeFormat.maxPacketSize, effectiveMaxPkt,
          isHighSpeed ? "High" : "Full",
          nominalFpp, bytesPerPacket, uacVersion);
 
-    // Allocate ring buffer: 200ms of output audio
+    // Allocate ring buffer: 200ms of output audio (in wire-format bytes)
     int ringSize = configuredRate * bytesPerFrame / 5; // 200ms
     if (ringSize < 65536) ringSize = 65536;
     delete ringBuffer;
@@ -636,10 +1033,21 @@ bool UsbAudioDriver::start() {
         return false;
     }
 
-    // Set sample rate based on UAC version
-    // Note: uacVersion is stored as integer (1 or 2), not BCD
-    if (uacVersion >= 2 && clockSourceId >= 0) {
-        setSampleRateUAC2(clockSourceId, configuredRate);
+    // Set sample rate based on UAC version. Use the active format's clock
+    // source so DAC+ADC devices don't accidentally set the capture clock when
+    // we meant to set the playback clock.
+    int csIdForStart = activeFormat.clockSourceId >= 0
+            ? activeFormat.clockSourceId : clockSourceId;
+    if (uacVersion >= 2 && csIdForStart >= 0) {
+        if (!setSampleRateUAC2(csIdForStart, configuredRate)) {
+            // DAC rejected the rate. Abort before shipping isochronous packets:
+            // sending data at a rate the DAC isn't clocking for produces loud
+            // noise on the analog output, which is worse than silence.
+            LOGE("start(): aborting because the DAC rejected sample rate %d Hz",
+                 configuredRate);
+            stop();
+            return false;
+        }
     } else {
         setSampleRate(activeFormat.endpointAddr, configuredRate);
     }
@@ -751,8 +1159,10 @@ bool UsbAudioDriver::start() {
 
 int UsbAudioDriver::write(const uint8_t* data, int length) {
     if (!streaming.load() || !ringBuffer) return -1;
-    // Align write to frame boundary to prevent sample misalignment in ring buffer
-    int bytesPerFrame = (configuredBitDepth / 8) * configuredChannels;
+    // Align write to wire-frame boundary to prevent sample misalignment.
+    // Caller is responsible for producing data already padded to subslot width
+    // (e.g., DoP packer pads 24-bit-in-32 with LSB padding when subslot != 3).
+    int bytesPerFrame = configuredSubslotSize * configuredChannels;
     if (bytesPerFrame > 0) {
         size_t space = ringBuffer->getFreeSpace();
         int aligned = ((int)space / bytesPerFrame) * bytesPerFrame;
@@ -765,71 +1175,51 @@ int UsbAudioDriver::write(const uint8_t* data, int length) {
 int UsbAudioDriver::writeFloat32(const float* data, int numSamples) {
     if (!streaming.load() || !ringBuffer) return -1;
 
-    int bytesPerSample = configuredBitDepth / 8;
+    // subslotSize is the on-wire byte count per sample; bitDepth is the data range.
+    // When subslot > bitDepth/8 (e.g., 24-bit-in-32-bit), unused bits are at the LSB
+    // end per UAC2 spec, so the data value is left-aligned in the subslot.
+    int subslotBytes = configuredSubslotSize;
+    int padBits = subslotBytes * 8 - configuredBitDepth;
+    if (padBits < 0) padBits = 0;
 
-    // Convert in chunks to avoid large stack allocation
     const int CHUNK = 512;
-    uint8_t convBuf[CHUNK * 4]; // max 4 bytes per sample (32-bit)
+    uint8_t convBuf[CHUNK * 4]; // max 4 bytes per sample
     int totalConsumed = 0;
 
     while (totalConsumed < numSamples) {
         int batch = std::min(CHUNK, numSamples - totalConsumed);
 
-        // Pre-check free space and limit batch to what fits, aligned to sample size.
-        // This prevents partial-sample writes that corrupt frame alignment.
-        // getFreeSpace() is a lower bound (reader may free more), so the
-        // subsequent write is guaranteed to accept the full batch.
         size_t space = ringBuffer->getFreeSpace();
-        int fitSamples = (int)(space / bytesPerSample);
+        int fitSamples = (int)(space / subslotBytes);
         if (fitSamples <= 0) break;
         batch = std::min(batch, fitSamples);
 
         int outBytes = 0;
 
+        const float gain = softwareGain.load(std::memory_order_relaxed);
         for (int i = 0; i < batch; i++) {
-            float s = data[totalConsumed + i];
-            // Clamp
+            float s = data[totalConsumed + i] * gain;
             if (s > 1.0f) s = 1.0f;
             else if (s < -1.0f) s = -1.0f;
 
+            int32_t v;
             switch (configuredBitDepth) {
-                case 16: {
-                    int16_t v = (int16_t)(s * 32767.0f);
-                    convBuf[outBytes++] = v & 0xFF;
-                    convBuf[outBytes++] = (v >> 8) & 0xFF;
-                    break;
-                }
-                case 24: {
-                    int32_t v = (int32_t)(s * 8388607.0f);
-                    convBuf[outBytes++] = v & 0xFF;
-                    convBuf[outBytes++] = (v >> 8) & 0xFF;
-                    convBuf[outBytes++] = (v >> 16) & 0xFF;
-                    break;
-                }
-                case 32: {
-                    int32_t v = (int32_t)(s * 2147483647.0f);
-                    convBuf[outBytes++] = v & 0xFF;
-                    convBuf[outBytes++] = (v >> 8) & 0xFF;
-                    convBuf[outBytes++] = (v >> 16) & 0xFF;
-                    convBuf[outBytes++] = (v >> 24) & 0xFF;
-                    break;
-                }
-                default: {
-                    int16_t v = (int16_t)(s * 32767.0f);
-                    convBuf[outBytes++] = v & 0xFF;
-                    convBuf[outBytes++] = (v >> 8) & 0xFF;
-                    break;
-                }
+                case 16: v = (int32_t)(s * 32767.0f);      break;
+                case 24: v = (int32_t)(s * 8388607.0f);    break;
+                case 32: v = (int32_t)(s * 2147483647.0f); break;
+                default: v = (int32_t)(s * 32767.0f);      break;
+            }
+            int32_t wire = v << padBits;
+            for (int b = 0; b < subslotBytes; b++) {
+                convBuf[outBytes++] = (wire >> (b * 8)) & 0xFF;
             }
         }
 
         int written = (int)ringBuffer->write(convBuf, outBytes);
-        int samplesWritten = written / bytesPerSample;
+        int samplesWritten = written / subslotBytes;
         totalConsumed += samplesWritten;
 
-        if (samplesWritten < batch) {
-            break; // ring buffer full, return what we consumed
-        }
+        if (samplesWritten < batch) break;
     }
 
     return totalConsumed;
@@ -838,68 +1228,153 @@ int UsbAudioDriver::writeFloat32(const float* data, int numSamples) {
 int UsbAudioDriver::writeInt16(const int16_t* data, int numSamples) {
     if (!streaming.load() || !ringBuffer) return -1;
 
-    int bytesPerSample = configuredBitDepth / 8;
+    // Upscale 16-bit data into the DAC's wire format. The data is left-aligned
+    // within the subslot (per UAC2: padding at LSB end).
+    int subslotBytes = configuredSubslotSize;
+    int dataShift = (subslotBytes * 8) - 16;
+    if (dataShift < 0) dataShift = 0;
 
-    // Convert in chunks to avoid large stack allocation
     const int CHUNK = 512;
-    uint8_t convBuf[CHUNK * 4]; // max 4 bytes per sample (32-bit)
+    uint8_t convBuf[CHUNK * 4]; // max 4 bytes per sample
     int totalConsumed = 0;
 
     while (totalConsumed < numSamples) {
         int batch = std::min(CHUNK, numSamples - totalConsumed);
 
-        // Pre-check free space and limit batch to what fits, aligned to sample size.
         size_t space = ringBuffer->getFreeSpace();
-        int fitSamples = (int)(space / bytesPerSample);
+        int fitSamples = (int)(space / subslotBytes);
         if (fitSamples <= 0) break;
         batch = std::min(batch, fitSamples);
 
         int outBytes = 0;
 
+        const float gain = softwareGain.load(std::memory_order_relaxed);
         for (int i = 0; i < batch; i++) {
             int16_t s = data[totalConsumed + i];
-
-            switch (configuredBitDepth) {
-                case 16: {
-                    // Bit-perfect passthrough
-                    convBuf[outBytes++] = s & 0xFF;
-                    convBuf[outBytes++] = (s >> 8) & 0xFF;
-                    break;
-                }
-                case 24: {
-                    // Shift left 8 to place 16-bit data in upper bits of 24-bit
-                    int32_t v = (int32_t)s << 8;
-                    convBuf[outBytes++] = v & 0xFF;
-                    convBuf[outBytes++] = (v >> 8) & 0xFF;
-                    convBuf[outBytes++] = (v >> 16) & 0xFF;
-                    break;
-                }
-                case 32: {
-                    // Shift left 16 to place 16-bit data in upper bits of 32-bit
-                    int32_t v = (int32_t)s << 16;
-                    convBuf[outBytes++] = v & 0xFF;
-                    convBuf[outBytes++] = (v >> 8) & 0xFF;
-                    convBuf[outBytes++] = (v >> 16) & 0xFF;
-                    convBuf[outBytes++] = (v >> 24) & 0xFF;
-                    break;
-                }
-                default: {
-                    convBuf[outBytes++] = s & 0xFF;
-                    convBuf[outBytes++] = (s >> 8) & 0xFF;
-                    break;
-                }
+            int32_t scaled;
+            if (gain >= 0.9999f) {
+                scaled = (int32_t)s;
+            } else {
+                float fs = (float)s * gain;
+                if (fs > 32767.0f) fs = 32767.0f;
+                else if (fs < -32768.0f) fs = -32768.0f;
+                scaled = (int32_t)fs;
+            }
+            int32_t wire = scaled << dataShift;
+            for (int b = 0; b < subslotBytes; b++) {
+                convBuf[outBytes++] = (wire >> (b * 8)) & 0xFF;
             }
         }
 
         int written = (int)ringBuffer->write(convBuf, outBytes);
-        int samplesWritten = written / bytesPerSample;
+        int samplesWritten = written / subslotBytes;
         totalConsumed += samplesWritten;
 
-        if (samplesWritten < batch) {
-            break; // ring buffer full
-        }
+        if (samplesWritten < batch) break;
     }
 
+    return totalConsumed;
+}
+
+int UsbAudioDriver::writeInt24Packed(const uint8_t* data, int numBytes) {
+    // 24-bit packed PCM: 3 bytes little-endian signed per sample. Sample-align
+    // to the next multiple of 3 from the caller; this method assumes whole samples.
+    if (!streaming.load() || !ringBuffer) return -1;
+    int numSamples = numBytes / 3;
+    if (numSamples <= 0) return 0;
+
+    int subslotBytes = configuredSubslotSize;
+    int padBits = subslotBytes * 8 - configuredBitDepth;
+    if (padBits < 0) padBits = 0;
+
+    const int CHUNK = 512;
+    uint8_t convBuf[CHUNK * 4];
+    int totalConsumed = 0;
+
+    while (totalConsumed < numSamples) {
+        int batch = std::min(CHUNK, numSamples - totalConsumed);
+        size_t space = ringBuffer->getFreeSpace();
+        int fitSamples = (int)(space / subslotBytes);
+        if (fitSamples <= 0) break;
+        batch = std::min(batch, fitSamples);
+
+        const float gain = softwareGain.load(std::memory_order_relaxed);
+        int outBytes = 0;
+        for (int i = 0; i < batch; i++) {
+            int off = (totalConsumed + i) * 3;
+            // Sign-extend 24-bit LE to int32: load 3 bytes into bits 8..31 then arithmetic shift down.
+            int32_t v = ((int32_t)data[off] << 8)
+                      | ((int32_t)data[off + 1] << 16)
+                      | ((int32_t)data[off + 2] << 24);
+            v >>= 8;  // arithmetic shift, preserves sign
+
+            if (gain < 0.9999f) {
+                float fs = (float)v * gain;
+                if (fs > 8388607.0f) fs = 8388607.0f;
+                else if (fs < -8388608.0f) fs = -8388608.0f;
+                v = (int32_t)fs;
+            }
+
+            // The value is 24-bit; left-align inside the DAC subslot.
+            int dataShift = (subslotBytes * 8) - 24;
+            if (dataShift < 0) dataShift = 0;
+            int32_t wire = v << dataShift;
+            for (int b = 0; b < subslotBytes; b++) {
+                convBuf[outBytes++] = (wire >> (b * 8)) & 0xFF;
+            }
+        }
+
+        int written = (int)ringBuffer->write(convBuf, outBytes);
+        int samplesWritten = written / subslotBytes;
+        totalConsumed += samplesWritten;
+        if (samplesWritten < batch) break;
+    }
+    return totalConsumed;
+}
+
+int UsbAudioDriver::writeInt32(const int32_t* data, int numSamples) {
+    if (!streaming.load() || !ringBuffer) return -1;
+    if (numSamples <= 0) return 0;
+
+    int subslotBytes = configuredSubslotSize;
+    // 32-bit data is already full-range; no left-align padding needed for 32-bit DAC.
+    // For 24-bit DAC reception of 32-bit source, we lose 8 LSBs by simple truncation.
+    int dataShift = (subslotBytes * 8) - 32;
+    if (dataShift < 0) dataShift = 0;
+
+    const int CHUNK = 512;
+    uint8_t convBuf[CHUNK * 4];
+    int totalConsumed = 0;
+
+    while (totalConsumed < numSamples) {
+        int batch = std::min(CHUNK, numSamples - totalConsumed);
+        size_t space = ringBuffer->getFreeSpace();
+        int fitSamples = (int)(space / subslotBytes);
+        if (fitSamples <= 0) break;
+        batch = std::min(batch, fitSamples);
+
+        const float gain = softwareGain.load(std::memory_order_relaxed);
+        int outBytes = 0;
+        for (int i = 0; i < batch; i++) {
+            int32_t v = data[totalConsumed + i];
+            if (gain < 0.9999f) {
+                // float has 24-bit mantissa -- enough for typical attenuation work.
+                float fs = (float)v * gain;
+                if (fs > 2147483520.0f) fs = 2147483520.0f;
+                else if (fs < -2147483648.0f) fs = -2147483648.0f;
+                v = (int32_t)fs;
+            }
+            int32_t wire = v << dataShift;
+            for (int b = 0; b < subslotBytes; b++) {
+                convBuf[outBytes++] = (wire >> (b * 8)) & 0xFF;
+            }
+        }
+
+        int written = (int)ringBuffer->write(convBuf, outBytes);
+        int samplesWritten = written / subslotBytes;
+        totalConsumed += samplesWritten;
+        if (samplesWritten < batch) break;
+    }
     return totalConsumed;
 }
 
@@ -1023,6 +1498,7 @@ void UsbAudioDriver::close() {
     opened = false;
     uacVersion = 1;
     clockSourceId = -1;
+    configuredSubslotSize = 0;
     LOGI("USB audio device closed");
 }
 

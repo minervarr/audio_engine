@@ -114,6 +114,10 @@ public class AudioEngine {
     private DsfParser dsfParser;
     private DffParser dffParser;
     private RandomAccessFile dsdFile;
+    private DsdMode dsdMode = DsdMode.AUTO;       // user preference
+    private volatile DsdMode activeDsdMode;       // resolved mode for current track
+    private final int[] dopFrameCounter = new int[1];
+    private int dsdOutputSubslotBytes = 3;        // wire bytes per sample for active DSD output
 
     private volatile long currentPositionUs;
     private volatile long seekTargetUs = -1;
@@ -165,7 +169,91 @@ public class AudioEngine {
     }
 
     public boolean isDopMode() {
-        return false;
+        return activeDsdMode == DsdMode.DOP;
+    }
+
+    public DsdMode getActiveDsdMode() {
+        return activeDsdMode;
+    }
+
+    public void setDsdMode(DsdMode mode) {
+        this.dsdMode = (mode != null) ? mode : DsdMode.AUTO;
+    }
+
+    // === Volume passthroughs ===
+    // The engine remembers the user's mode + volume in fields so that setters
+    // called before the output exists (e.g., right after `new AudioEngine()`)
+    // are not dropped. State is pushed to the output on switchOutput().
+
+    private VolumeMode currentVolumeMode = VolumeMode.AUTO;
+    private float currentVolumeLinear = 0f;
+
+    public void setVolume(float linear01) {
+        if (Float.isNaN(linear01)) linear01 = 0f;
+        if (linear01 < 0f) linear01 = 0f;
+        if (linear01 > 1f) linear01 = 1f;
+        this.currentVolumeLinear = linear01;
+        synchronized (outputLock) {
+            if (output instanceof UsbAudioOutput) {
+                ((UsbAudioOutput) output).setVolume(linear01);
+            }
+        }
+    }
+
+    public void setVolumeMode(VolumeMode mode) {
+        this.currentVolumeMode = (mode != null) ? mode : VolumeMode.AUTO;
+        synchronized (outputLock) {
+            if (output instanceof UsbAudioOutput) {
+                ((UsbAudioOutput) output).setVolumeMode(this.currentVolumeMode);
+            }
+        }
+    }
+
+    /** Apply the engine's saved volume state to the currently-set USB output, if any. */
+    private void pushVolumeStateToOutput() {
+        if (output instanceof UsbAudioOutput) {
+            UsbAudioOutput usb = (UsbAudioOutput) output;
+            usb.setVolumeMode(currentVolumeMode);
+            usb.setVolume(currentVolumeLinear);
+        }
+    }
+
+    public boolean hasHardwareVolume() {
+        synchronized (outputLock) {
+            return (output instanceof UsbAudioOutput)
+                    && ((UsbAudioOutput) output).hasHardwareVolume();
+        }
+    }
+
+    public float getVolumeLinear() {
+        return currentVolumeLinear;
+    }
+
+    public VolumeMode getEffectiveVolumeMode() {
+        synchronized (outputLock) {
+            if (output instanceof UsbAudioOutput) {
+                return ((UsbAudioOutput) output).getEffectiveVolumeMode();
+            }
+        }
+        return VolumeMode.SOFTWARE;
+    }
+
+    public double getVolumeDb() {
+        synchronized (outputLock) {
+            if (output instanceof UsbAudioOutput) {
+                return ((UsbAudioOutput) output).getVolumeDb();
+            }
+        }
+        return Double.NEGATIVE_INFINITY;
+    }
+
+    public float dbToLinear(double db) {
+        synchronized (outputLock) {
+            if (output instanceof UsbAudioOutput) {
+                return ((UsbAudioOutput) output).dbToLinear(db);
+            }
+        }
+        return 0f;
     }
 
     public int getDsdRate() {
@@ -521,8 +609,10 @@ public class AudioEngine {
     public boolean switchOutput(AudioOutput newOutput) {
         Log.d(TAG, "switchOutput: " + newOutput.getClass().getSimpleName());
         synchronized (outputLock) {
-            if (isDsd && newOutput instanceof AudioTrackOutput) {
-                Log.e(TAG, "Cannot switch DSD to speaker output");
+            // DSD-to-speaker is only valid when we're already in PCM-conversion mode.
+            if (isDsd && newOutput instanceof AudioTrackOutput
+                    && activeDsdMode != DsdMode.PCM) {
+                Log.e(TAG, "Cannot switch DSD to speaker output (mode=" + activeDsdMode + ")");
                 newOutput.release();
                 return false;
             }
@@ -537,8 +627,42 @@ public class AudioEngine {
                 output.release();
             }
             output = newOutput;
+            pushVolumeStateToOutput();  // restore mode + volume on the new output
             if (prepared) {
-                if (!output.configure(sampleRate, channelCount, encoding, sourceBitDepth)) {
+                boolean configured;
+                if (isDsd && output instanceof UsbAudioOutput) {
+                    UsbAudioOutput usb = (UsbAudioOutput) output;
+                    DsdMode requested = (activeDsdMode != null) ? activeDsdMode
+                            : (dsdMode != null ? dsdMode : DsdMode.AUTO);
+                    DsdMode actual = usb.configureDsd(dsdRate, channelCount, requested);
+                    if (actual != null) {
+                        boolean firstTime = (activeDsdMode == null);
+                        activeDsdMode = actual;
+                        applyDsdFormat(actual);
+                        dsdOutputSubslotBytes = resolveSubslot(actual, usb);
+                        codecName = "DSD " + actual;
+                        cachedFrameSize = channelCount * dsdOutputSubslotBytes;
+                        configured = true;
+                        if (firstTime) {
+                            // Pipeline was deferred from playDsd() -- start it now.
+                            if (!output.start()) {
+                                Log.e(TAG, "USB start failed after deferred DSD configure");
+                                output.release();
+                                output = null;
+                                return false;
+                            }
+                            startDsdDecodeThread();
+                            startOutputThread();
+                            if (!wasPlaying) output.pause();
+                            return true;
+                        }
+                    } else {
+                        configured = false;
+                    }
+                } else {
+                    configured = output.configure(sampleRate, channelCount, encoding, sourceBitDepth);
+                }
+                if (!configured) {
                     Log.e(TAG, "New output configure failed");
                     output.release();
                     if (isDsd) {
@@ -601,35 +725,78 @@ public class AudioEngine {
             }
 
             isDsd = true;
-            sampleRate = dsdRate / 32;
-            encoding = AudioFormat.ENCODING_PCM_32BIT;
             sourceBitDepth = 1;
             mime = "audio/dsd";
-            codecName = "DSD Native";
+            dopFrameCounter[0] = 0;
+            activeDsdMode = null;
 
-            Log.d(TAG, "DSD play: pcmRate=" + sampleRate + " dsdRate=" + dsdRate
-                    + " duration=" + (durationUs / 1000) + "ms");
+            DsdMode requested = (dsdMode != null) ? dsdMode : DsdMode.AUTO;
+            Log.d(TAG, "DSD play: dsdRate=" + dsdRate + " ch=" + channelCount
+                    + " requested=" + requested + " duration=" + (durationUs / 1000) + "ms");
 
             synchronized (outputLock) {
-                if (output == null) {
-                    output = new AudioTrackOutput();
-                }
-                if (!output.configure(sampleRate, channelCount, encoding, sourceBitDepth)) {
-                    // Speaker cannot handle DSD -- release output, await USB switch
-                    Log.w(TAG, "Output cannot handle DSD, awaiting USB switch");
-                    output.release();
-                    output = null;
+                if (requested == DsdMode.PCM) {
+                    // Force PCM conversion regardless of output type.
+                    if (output != null && !(output instanceof AudioTrackOutput)) {
+                        output.release();
+                        output = null;
+                    }
+                    if (output == null) {
+                        output = new AudioTrackOutput();
+                    }
+                    if (configurePcmFallback()) {
+                        output.start();
+                        activeDsdMode = DsdMode.PCM;
+                        dsdOutputSubslotBytes = 2; // PCM_16BIT to AudioTrack
+                    } else {
+                        Log.e(TAG, "PCM fallback configure failed");
+                        output.release();
+                        output = null;
+                    }
+                } else if (output instanceof UsbAudioOutput) {
+                    UsbAudioOutput usb = (UsbAudioOutput) output;
+                    DsdMode actual = usb.configureDsd(dsdRate, channelCount, requested);
+                    if (actual != null) {
+                        applyDsdFormat(actual);
+                        dsdOutputSubslotBytes = resolveSubslot(actual, usb);
+                        output.start();
+                        activeDsdMode = actual;
+                    } else {
+                        Log.w(TAG, "USB rejected requested DSD modes; awaiting switch");
+                        output.release();
+                        output = null;
+                    }
                 } else {
-                    output.start();
+                    // Speaker (or no output) but user wants Native/DoP/Auto.
+                    // Release speaker and wait for MusicService to bring in a USB output.
+                    if (output != null) {
+                        output.release();
+                        output = null;
+                    }
+                }
+
+                if (activeDsdMode != null) {
+                    codecName = "DSD " + activeDsdMode;
+                    cachedFrameSize = channelCount * dsdOutputSubslotBytes;
                 }
             }
 
+            Log.i(TAG, "DSD pipeline: requested=" + requested
+                    + " active=" + activeDsdMode
+                    + " sampleRate=" + sampleRate
+                    + " encoding=" + encoding
+                    + " subslotBytes=" + dsdOutputSubslotBytes);
+
             playing = true;
             prepared = true;
-            cachedFrameSize = channelCount * bytesPerSample();
 
-            startDsdDecodeThread();
-            startOutputThread();
+            if (activeDsdMode != null) {
+                startDsdDecodeThread();
+                startOutputThread();
+            } else {
+                // Pipeline starts inside switchOutput once USB arrives.
+                codecName = "DSD";
+            }
 
             if (onPreparedListener != null) {
                 onPreparedListener.onPrepared(this);
@@ -642,8 +809,60 @@ public class AudioEngine {
         }
     }
 
+    private boolean configurePcmFallback() {
+        sampleRate = dsdRate / 16;
+        encoding = AudioFormat.ENCODING_PCM_16BIT;
+        // Pass 16 as the source bit depth so AudioTrackOutput accepts the format;
+        // the decoder takes care of producing PCM_16BIT samples from the DSD stream.
+        return output.configure(sampleRate, channelCount, encoding, 16);
+    }
+
+    private void applyDsdFormat(DsdMode mode) {
+        switch (mode) {
+            case NATIVE:
+                sampleRate = dsdRate / 32;
+                encoding = AudioFormat.ENCODING_PCM_32BIT;
+                break;
+            case DOP:
+                sampleRate = dsdRate / 16;
+                encoding = AudioFormat.ENCODING_PCM_24BIT_PACKED;
+                break;
+            case PCM:
+                sampleRate = dsdRate / 16;
+                encoding = AudioFormat.ENCODING_PCM_16BIT;
+                break;
+            default:
+                break;
+        }
+    }
+
+    private int dsdOutputFrameSize(DsdMode mode) {
+        switch (mode) {
+            case NATIVE: return channelCount * 4;
+            case DOP:    return channelCount * dsdOutputSubslotBytes;
+            case PCM:    return channelCount * 2;
+            default:     return channelCount * 4;
+        }
+    }
+
+    private int resolveSubslot(DsdMode mode, UsbAudioOutput usb) {
+        switch (mode) {
+            case NATIVE:
+                return 4;
+            case DOP: {
+                int s = usb.getConfiguredSubslotSize();
+                return (s == 3 || s == 4) ? s : 3;
+            }
+            case PCM:
+                return 2;
+            default:
+                return 4;
+        }
+    }
+
     private void startDsdDecodeThread() {
-        Log.d(TAG, "DSD decode thread starting");
+        final DsdMode mode = activeDsdMode;
+        final int subslot = dsdOutputSubslotBytes;
         decodeThread = new Thread(() -> {
             int blockSize;
             boolean needBitReverse;
@@ -656,11 +875,16 @@ public class AudioEngine {
                 needBitReverse = false;
             }
 
+            Log.i(TAG, "DSD decode thread: mode=" + mode + " blockSize=" + blockSize
+                    + " bitReverse=" + needBitReverse + " subslot=" + subslot);
+
             byte[] leftBlock = new byte[blockSize];
             byte[] rightBlock = new byte[blockSize];
 
-            int framesPerBlock = blockSize / 4;
-            byte[] packed = new byte[framesPerBlock * channelCount * 4];
+            // Worst case across modes is DoP at 4-byte subslot: 4 output bytes per
+            // 2 input bytes per channel = 2x. Allocate for 2x with channels.
+            byte[] packed = new byte[blockSize * channelCount * 2];
+            boolean firstIteration = true;
 
             while (!stopped) {
                 if (seeking) {
@@ -695,23 +919,38 @@ public class AudioEngine {
                         }
                     }
 
-                    // Pack into 32-bit interleaved frames: [4 L bytes][4 R bytes]
-                    int packedPos = 0;
-                    if (channelCount >= 2) {
-                        for (int i = 0; i < blockSize; i += 4) {
-                            System.arraycopy(leftBlock, i, packed, packedPos, 4);
-                            packedPos += 4;
-                            System.arraycopy(rightBlock, i, packed, packedPos, 4);
-                            packedPos += 4;
-                        }
-                    } else {
-                        for (int i = 0; i < blockSize; i += 4) {
-                            System.arraycopy(leftBlock, i, packed, packedPos, 4);
-                            packedPos += 4;
-                        }
+                    int packedLen;
+                    switch (mode) {
+                        case NATIVE:
+                            packedLen = DsdPackager.packNative(
+                                    leftBlock, rightBlock, blockSize, channelCount, packed);
+                            break;
+                        case DOP:
+                            packedLen = DsdPackager.packDop(
+                                    leftBlock, rightBlock, blockSize, channelCount,
+                                    packed, dopFrameCounter, subslot);
+                            break;
+                        case PCM:
+                            packedLen = DsdPackager.decimateToPcm16(
+                                    leftBlock, rightBlock, blockSize, channelCount, packed);
+                            break;
+                        default:
+                            packedLen = 0;
+                            break;
                     }
 
-                    pcmBuffer.write(packed, 0, packedPos);
+                    if (firstIteration && packedLen >= 12) {
+                        StringBuilder sb = new StringBuilder("DSD first-frame packed:");
+                        for (int i = 0; i < 12; i++) {
+                            sb.append(String.format(" %02X", packed[i] & 0xFF));
+                        }
+                        Log.i(TAG, sb.toString());
+                        firstIteration = false;
+                    }
+
+                    if (packedLen > 0) {
+                        pcmBuffer.write(packed, 0, packedLen);
+                    }
 
                 } catch (InterruptedException e) {
                     break;
@@ -770,6 +1009,8 @@ public class AudioEngine {
         dffParser = null;
         isDsd = false;
         dsdRate = 0;
+        activeDsdMode = null;
+        dopFrameCounter[0] = 0;
         if (dsdFile != null) {
             try { dsdFile.close(); } catch (Exception ignored) {}
             dsdFile = null;
