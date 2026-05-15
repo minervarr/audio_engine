@@ -164,6 +164,10 @@ public class AudioEngine {
         return isDsd;
     }
 
+    public boolean isDopMode() {
+        return false;
+    }
+
     public int getDsdRate() {
         return dsdRate;
     }
