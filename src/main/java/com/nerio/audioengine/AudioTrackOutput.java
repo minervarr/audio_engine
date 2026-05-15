@@ -98,13 +98,13 @@ public class AudioTrackOutput implements AudioOutput {
                 convBuf = new byte[outBytes];
             }
             nativeFloatToInt16(data, offset, convBuf, samples);
-            int written = audioTrack.write(convBuf, 0, outBytes);
+            int written = audioTrack.write(convBuf, 0, outBytes, AudioTrack.WRITE_NON_BLOCKING);
             if (written < 0) return written;
             // Return the number of float input bytes consumed
             return (written / 2) * 4;
         }
 
-        return audioTrack.write(data, offset, length);
+        return audioTrack.write(data, offset, length, AudioTrack.WRITE_NON_BLOCKING);
     }
 
     @Override

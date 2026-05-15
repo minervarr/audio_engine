@@ -998,7 +998,7 @@ public class AudioEngine {
                             eqProcessor.process(readBuf, 0, read);
                         }
                         int pos = 0;
-                        while (pos < read && !stopped && !seeking) {
+                        while (pos < read && !stopped && !seeking && playing) {
                             int w;
                             synchronized (outputLock) {
                                 if (output != null) {
@@ -1091,7 +1091,9 @@ public class AudioEngine {
                         if (eqProcessor != null) eqProcessor.reset();
                         synchronized (outputLock) {
                             if (output != null) {
+                                output.pause();
                                 output.flush();
+                                output.resume();
                             }
                         }
                         codec.flush();
