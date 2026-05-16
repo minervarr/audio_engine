@@ -31,4 +31,15 @@ public class UsbAudioNative {
     public static native boolean nativeSetHardwareVolumeDbQ8(long handle, int valueDbQ8);
     public static native boolean nativeSetHardwareMute(long handle, boolean muted);
     public static native void nativeSetSoftwareGain(long handle, float gain);
+
+    // Capture (ADC -> host)
+    public static native boolean nativeConfigureCapture(long handle, int sampleRate, int channels, int bitDepth);
+    public static native boolean nativeStartCapture(long handle);
+    public static native int nativeReadCapture(long handle, byte[] buf, int offset, int maxLen);
+    public static native void nativeStopCapture(long handle);
+    public static native int nativeGetConfiguredCaptureRate(long handle);
+    public static native int nativeGetConfiguredCaptureChannels(long handle);
+    public static native int nativeGetConfiguredCaptureBitDepth(long handle);
+    public static native int nativeGetConfiguredCaptureSubslotSize(long handle);
+    public static native boolean nativeHasCaptureFormats(long handle);
 }

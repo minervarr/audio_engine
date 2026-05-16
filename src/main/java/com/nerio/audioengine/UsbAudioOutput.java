@@ -9,6 +9,8 @@ public class UsbAudioOutput implements AudioOutput {
 
     private long nativeHandle;
     private final int fd;
+    private final UsbAudioDevice owner;   // non-null when this view is owned by an UsbAudioDevice
+    private boolean released;
     private boolean started;
 
     private int inputEncoding;
@@ -20,6 +22,18 @@ public class UsbAudioOutput implements AudioOutput {
 
     public UsbAudioOutput(int fd) {
         this.fd = fd;
+        this.owner = null;
+    }
+
+    /**
+     * Internal constructor used by {@link UsbAudioDevice} to share an already-opened
+     * native handle between a playback and a capture view. The owner is notified
+     * on {@link #release()} so it can refcount the native close.
+     */
+    UsbAudioOutput(int fd, long nativeHandle, UsbAudioDevice owner) {
+        this.fd = fd;
+        this.nativeHandle = nativeHandle;
+        this.owner = owner;
     }
 
     public boolean open() {
@@ -438,8 +452,15 @@ public class UsbAudioOutput implements AudioOutput {
 
     @Override
     public void release() {
+        if (released) return;
+        released = true;
         stop();
-        if (nativeHandle != 0) {
+        if (owner != null) {
+            // The owning UsbAudioDevice refcounts release across views and will
+            // call nativeClose itself when the last view (output or input) is gone.
+            owner.notifyViewReleased();
+            nativeHandle = 0;
+        } else if (nativeHandle != 0) {
             UsbAudioNative.nativeClose(nativeHandle);
             nativeHandle = 0;
         }

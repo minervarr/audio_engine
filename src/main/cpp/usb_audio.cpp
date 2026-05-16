@@ -88,6 +88,9 @@ bool UsbAudioDriver::parseDescriptors() {
     // Terminal IDs whose wTerminalType == 0x0101 (USB streaming) coming IN
     // to the audio function -- i.e., the playback-path entry points.
     std::unordered_map<int, bool> isUsbStreamingIT;
+    // Terminal IDs that represent physical audio entering the function
+    // (Microphone 0x0201..0x0205, External 0x0601..0x0603, etc.) -- capture sources.
+    std::unordered_map<int, bool> isCaptureSourceIT;
     struct FuCandidate { int unitId; int sourceId; bool hasVolume; bool hasMute; };
     std::vector<FuCandidate> featureUnits;
     volumeFuUnitId = -1;
@@ -136,7 +139,15 @@ bool UsbAudioDriver::parseDescriptors() {
                         int csId = extra[pos + 7];
                         terminalToClock[termId] = csId;
                         // 0x0101 = USB streaming -> playback entry point.
-                        if (termType == 0x0101) isUsbStreamingIT[termId] = true;
+                        // Anything outside the 0x01xx (USB function) category is a
+                        // physical capture source: Microphone (0x02xx), External
+                        // (0x06xx), etc. Track those so we can identify capture
+                        // alt-settings in pass 2.
+                        if (termType == 0x0101) {
+                            isUsbStreamingIT[termId] = true;
+                        } else if ((termType & 0xFF00) != 0x0100) {
+                            isCaptureSourceIT[termId] = true;
+                        }
                         LOGI("UAC2 Input Terminal %d (type 0x%04x) -> Clock %d", termId, termType, csId);
                     }
                     // UAC2 Output Terminal (data flowing OUT of audio function): bCSourceID at offset 8
@@ -238,26 +249,26 @@ bool UsbAudioDriver::parseDescriptors() {
             if (alt.bInterfaceClass != 1 || alt.bInterfaceSubClass != 2) continue;
             if (alt.bNumEndpoints == 0) continue;
 
-            // Find isochronous OUT endpoint and optional feedback IN endpoint
-            int epAddr = -1;
-            int feedbackEp = -1;
-            int rawMaxPacket = 0;
+            // Walk endpoints. We classify direction here but don't decide which
+            // is data vs. feedback yet -- that depends on whether the AS feeds
+            // a playback (USB-streaming) IT or a capture-source IT, which we
+            // learn from AS_GENERAL.bTerminalLink parsed below.
+            int outEp = -1, inEp = -1;
+            int rawMaxPacketOut = 0, rawMaxPacketIn = 0;
 
             for (int e = 0; e < alt.bNumEndpoints; e++) {
                 const struct libusb_endpoint_descriptor& ep = alt.endpoint[e];
                 if ((ep.bmAttributes & 0x03) != LIBUSB_TRANSFER_TYPE_ISOCHRONOUS) continue;
 
                 if ((ep.bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_OUT) {
-                    epAddr = ep.bEndpointAddress;
-                    rawMaxPacket = ep.wMaxPacketSize;
+                    outEp = ep.bEndpointAddress;
+                    rawMaxPacketOut = ep.wMaxPacketSize;
                 } else {
-                    // Isochronous IN = feedback endpoint
-                    feedbackEp = ep.bEndpointAddress;
-                    LOGI("  Feedback EP 0x%02x on iface %d alt %d",
-                         feedbackEp, alt.bInterfaceNumber, alt.bAlternateSetting);
+                    inEp = ep.bEndpointAddress;
+                    rawMaxPacketIn = ep.wMaxPacketSize;
                 }
             }
-            if (epAddr < 0) continue;
+            if (outEp < 0 && inEp < 0) continue;
 
             // Parse class-specific AS descriptors for format info
             int channels = 2;
@@ -339,6 +350,34 @@ bool UsbAudioDriver::parseDescriptors() {
             }
             if (resolvedClockId < 0) resolvedClockId = clockSourceId;
 
+            // Direction: capture iff bTerminalLink points to a physical source IT
+            // (Microphone/Line-in/etc.). On capture alt-settings the IN EP carries
+            // data and there is no async feedback EP (capture is source-clocked).
+            // Without a positive capture hint we keep legacy behavior: iso OUT is
+            // data, iso IN is feedback.
+            bool isCaptureAs = false;
+            if (uacVersion >= 2 && bTerminalLink > 0
+                    && isCaptureSourceIT.count(bTerminalLink)) {
+                isCaptureAs = true;
+            }
+
+            int dataEp, rawMaxPacket, fbEp;
+            if (isCaptureAs) {
+                if (inEp < 0) continue;            // capture AS without IN EP is malformed
+                dataEp = inEp;
+                rawMaxPacket = rawMaxPacketIn;
+                fbEp = -1;
+            } else {
+                if (outEp < 0) continue;           // playback AS without OUT EP -- skip
+                dataEp = outEp;
+                rawMaxPacket = rawMaxPacketOut;
+                fbEp = inEp;
+                if (fbEp >= 0) {
+                    LOGI("  Feedback EP 0x%02x on iface %d alt %d",
+                         fbEp, alt.bInterfaceNumber, alt.bAlternateSetting);
+                }
+            }
+
             if (rates.empty()) {
                 // Prefer rates for this alt's own clock source. On DAC+ADC devices
                 // this keeps the ADC's lower ceiling from leaking into playback.
@@ -365,7 +404,7 @@ bool UsbAudioDriver::parseDescriptors() {
                 UsbAudioFormat fmt{};
                 fmt.interfaceNum = alt.bInterfaceNumber;
                 fmt.altSetting = alt.bAlternateSetting;
-                fmt.endpointAddr = epAddr;
+                fmt.endpointAddr = dataEp;
                 fmt.maxPacketSize = rawMaxPacket;
                 fmt.sampleRate = rate;
                 fmt.channels = channels;
@@ -373,7 +412,8 @@ bool UsbAudioDriver::parseDescriptors() {
                 fmt.subslotSize = effectiveSubslot;
                 fmt.bmFormats = bmFormats;
                 fmt.isDsd = (bmFormats & 0x80000000u) != 0;
-                fmt.feedbackEpAddr = feedbackEp;
+                fmt.isCapture = isCaptureAs;
+                fmt.feedbackEpAddr = fbEp;
                 fmt.clockSourceId = resolvedClockId;
                 formats.push_back(fmt);
             }
@@ -384,13 +424,15 @@ bool UsbAudioDriver::parseDescriptors() {
 
     // Duplicate-alt heuristic: some DACs expose two alt-settings with identical
     // (rate, channels, bitDepth) but don't set the RAW_DATA bit in bmFormats.
-    // When that happens, assume the higher-numbered alt is the DSD one.
+    // When that happens, assume the higher-numbered alt is the DSD one. Only
+    // applies within a single direction -- capture alts never produce DSD.
     for (auto& f : formats) {
-        if (f.isDsd) continue;
+        if (f.isDsd || f.isCapture) continue;
         bool dsdAlreadyInGroup = false;
         UsbAudioFormat* higher = nullptr;
         for (auto& g : formats) {
             if (&g == &f) continue;
+            if (g.isCapture) continue;
             if (g.sampleRate != f.sampleRate) continue;
             if (g.channels != f.channels) continue;
             if (g.bitDepth != f.bitDepth) continue;
@@ -409,10 +451,10 @@ bool UsbAudioDriver::parseDescriptors() {
 
     LOGI("Parsed %zu format(s), UAC%d", formats.size(), uacVersion);
     for (auto& f : formats) {
-        LOGI("  iface=%d alt=%d ep=0x%02x rate=%d ch=%d bits=%d subslot=%d bmFormats=0x%08x dsd=%d clk=%d maxpkt=0x%04x fb=0x%02x",
+        LOGI("  iface=%d alt=%d ep=0x%02x rate=%d ch=%d bits=%d subslot=%d bmFormats=0x%08x dsd=%d cap=%d clk=%d maxpkt=0x%04x fb=0x%02x",
              f.interfaceNum, f.altSetting, f.endpointAddr,
              f.sampleRate, f.channels, f.bitDepth, f.subslotSize,
-             f.bmFormats, f.isDsd ? 1 : 0, f.clockSourceId,
+             f.bmFormats, f.isDsd ? 1 : 0, f.isCapture ? 1 : 0, f.clockSourceId,
              f.maxPacketSize, f.feedbackEpAddr);
     }
 
@@ -725,8 +767,10 @@ bool UsbAudioDriver::configure(int sampleRate, int channels, int bitDepth, bool 
 
     // Pass 1: exact match including DSD preference. When preferDsd is true we
     // only accept a DSD-flagged alt; when false we only accept a non-DSD alt.
+    // Capture alts (ADC IN) are never candidates for the playback configure().
     UsbAudioFormat* best = nullptr;
     for (auto& f : formats) {
+        if (f.isCapture) continue;
         if (f.sampleRate == sampleRate && f.channels == channels && f.bitDepth == bitDepth
                 && f.isDsd == preferDsd) {
             best = &f;
@@ -736,6 +780,7 @@ bool UsbAudioDriver::configure(int sampleRate, int channels, int bitDepth, bool 
     // Pass 2: exact match on (rate, channels, bits) ignoring DSD flag.
     if (!best) {
         for (auto& f : formats) {
+            if (f.isCapture) continue;
             if (f.sampleRate == sampleRate && f.channels == channels && f.bitDepth == bitDepth) {
                 best = &f;
                 break;
@@ -745,6 +790,7 @@ bool UsbAudioDriver::configure(int sampleRate, int channels, int bitDepth, bool 
     // Relax: match rate, prefer highest bit depth
     if (!best) {
         for (auto& f : formats) {
+            if (f.isCapture) continue;
             if (f.sampleRate == sampleRate) {
                 if (!best || f.bitDepth > best->bitDepth) {
                     best = &f;
@@ -1136,6 +1182,23 @@ bool UsbAudioDriver::start() {
     }
 
     // Start event handling thread with elevated priority
+    ensureEventThread();
+
+    LOGI("USB audio streaming started (%d transfers, ring=%d bytes)", NUM_TRANSFERS, ringSize);
+    return true;
+}
+
+// Event-thread refcount. The thread services libusb callbacks for BOTH the OUT
+// pipeline and the capture pipeline; we share one thread per device so a single
+// libusb context dispatches both directions. Each start() / startCapture() bumps
+// the user count; each stop() / stopCapture() decrements it. The thread exits
+// when the count hits zero.
+void UsbAudioDriver::ensureEventThread() {
+    int prev = eventThreadUsers.fetch_add(1, std::memory_order_acq_rel);
+    if (prev > 0) {
+        // Already running for another direction.
+        return;
+    }
     eventThread = std::thread([this]() {
         // THREAD_PRIORITY_URGENT_AUDIO equivalent (-19), no starvation risk
         if (setpriority(PRIO_PROCESS, 0, -19) != 0) {
@@ -1145,16 +1208,23 @@ bool UsbAudioDriver::start() {
         }
 
         LOGI("Event thread started");
-        while (streaming.load() && activeTransfers.load() > 0) {
+        while (eventThreadUsers.load(std::memory_order_acquire) > 0) {
             struct timeval tv = {0, 10000}; // 10ms timeout
             libusb_handle_events_timeout_completed(ctx, &tv, nullptr);
         }
-        LOGI("Event thread exited (streaming=%d active=%d)",
-             streaming.load() ? 1 : 0, activeTransfers.load());
+        LOGI("Event thread exited");
     });
+}
 
-    LOGI("USB audio streaming started (%d transfers, ring=%d bytes)", NUM_TRANSFERS, ringSize);
-    return true;
+void UsbAudioDriver::releaseEventThread() {
+    int prev = eventThreadUsers.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev != 1) {
+        // Other direction still streaming -- thread stays up.
+        return;
+    }
+    if (eventThread.joinable()) {
+        eventThread.join();
+    }
 }
 
 int UsbAudioDriver::write(const uint8_t* data, int length) {
@@ -1385,14 +1455,11 @@ void UsbAudioDriver::flush() {
 }
 
 void UsbAudioDriver::stop() {
-    streaming.store(false);
-
-    // Wait for event thread to exit before touching any libusb resources.
-    // The thread loop checks streaming.load() and will exit after its current
-    // libusb_handle_events_timeout_completed returns (at most 10ms).
-    if (eventThread.joinable()) {
-        eventThread.join();
+    if (!streaming.load() && eventThreadUsers.load() == 0) {
+        // Already stopped -- avoid double-release of the event thread refcount.
+        return;
     }
+    bool wasStreaming = streaming.exchange(false);
 
     if (ctx) {
         // Process pending events to let transfers complete
@@ -1448,7 +1515,9 @@ void UsbAudioDriver::stop() {
         libusb_release_interface(handle, activeFormat.interfaceNum);
         interfaceClaimed = false;
     }
-    if (handle && acInterfaceClaimed) {
+    // AC interface is shared with the capture pipeline -- keep it claimed while
+    // capture is still streaming. close() will release it as a last step.
+    if (handle && acInterfaceClaimed && !capStreaming.load()) {
         libusb_release_interface(handle, acInterfaceNum);
         acInterfaceClaimed = false;
     }
@@ -1463,12 +1532,396 @@ void UsbAudioDriver::stop() {
     currentFeedback.store(0, std::memory_order_relaxed);
     feedbackAccumulator = 0.0;
 
+    if (wasStreaming) {
+        releaseEventThread();
+    }
+
     LOGI("USB audio streaming stopped");
 }
 
-void UsbAudioDriver::close() {
-    LOGI("close() called, streaming=%d opened=%d", streaming.load() ? 1 : 0, opened);
+// =====================================================================
+//  Capture pipeline (ADC -> host). Mirrors the OUT pipeline in reverse.
+// =====================================================================
 
+bool UsbAudioDriver::hasCaptureFormats() const {
+    for (auto& f : formats) {
+        if (f.isCapture) return true;
+    }
+    return false;
+}
+
+bool UsbAudioDriver::configureCapture(int sampleRate, int channels, int bitDepth) {
+    if (!opened) {
+        LOGE("configureCapture() called but not opened");
+        return false;
+    }
+    if (capStreaming.load()) {
+        LOGI("configureCapture() called while capturing -- stopping first");
+        stopCapture();
+    }
+
+    LOGI("configureCapture requested: rate=%d ch=%d bits=%d", sampleRate, channels, bitDepth);
+
+    // Two-pass match on capture-only alts.
+    UsbAudioFormat* best = nullptr;
+    for (auto& f : formats) {
+        if (!f.isCapture) continue;
+        if (f.sampleRate == sampleRate && f.channels == channels && f.bitDepth == bitDepth) {
+            best = &f;
+            break;
+        }
+    }
+    if (!best) {
+        for (auto& f : formats) {
+            if (!f.isCapture) continue;
+            if (f.sampleRate == sampleRate && f.channels == channels) {
+                if (!best || f.bitDepth > best->bitDepth) best = &f;
+            }
+        }
+    }
+    if (!best) {
+        for (auto& f : formats) {
+            if (!f.isCapture) continue;
+            if (f.sampleRate == sampleRate) {
+                if (!best || f.bitDepth > best->bitDepth) best = &f;
+            }
+        }
+    }
+    if (!best) {
+        LOGE("No matching capture format for rate=%d ch=%d bits=%d",
+             sampleRate, channels, bitDepth);
+        return false;
+    }
+
+    // Shared-clock devices: if playback is running on the same clock, the rate
+    // is already pinned -- refuse a mismatched capture rate rather than yank
+    // the playback's clock out from under it.
+    if (streaming.load() && best->clockSourceId >= 0
+            && best->clockSourceId == activeFormat.clockSourceId
+            && sampleRate != configuredRate) {
+        LOGE("shared clock between DAC and ADC; capture must use playback rate %d Hz",
+             configuredRate);
+        return false;
+    }
+
+    capActiveFormat = *best;
+    capRate = sampleRate;
+    capChannels = best->channels;
+    capBitDepth = best->bitDepth;
+    capSubslotSize = (best->subslotSize > 0) ? best->subslotSize : ((best->bitDepth + 7) / 8);
+    capConfigured = true;
+
+    LOGI("Configured capture: rate=%d ch=%d bits=%d subslot=%d iface=%d alt=%d ep=0x%02x clk=%d",
+         capRate, capChannels, capBitDepth, capSubslotSize,
+         capActiveFormat.interfaceNum, capActiveFormat.altSetting,
+         capActiveFormat.endpointAddr, capActiveFormat.clockSourceId);
+    return true;
+}
+
+void UsbAudioDriver::captureCallback(struct libusb_transfer* transfer) {
+    auto* driver = static_cast<UsbAudioDriver*>(transfer->user_data);
+    driver->handleCaptureComplete(transfer);
+}
+
+void UsbAudioDriver::handleCaptureComplete(struct libusb_transfer* transfer) {
+    if (!capStreaming.load()) {
+        capActiveTransfers--;
+        return;
+    }
+
+    if (transfer->status != LIBUSB_TRANSFER_COMPLETED &&
+        transfer->status != LIBUSB_TRANSFER_TIMED_OUT) {
+        LOGE("Capture transfer status=%d (%s)", transfer->status,
+             transfer->status == LIBUSB_TRANSFER_ERROR ? "ERROR" :
+             transfer->status == LIBUSB_TRANSFER_STALL ? "STALL" :
+             transfer->status == LIBUSB_TRANSFER_NO_DEVICE ? "NO_DEVICE" :
+             transfer->status == LIBUSB_TRANSFER_OVERFLOW ? "OVERFLOW" :
+             transfer->status == LIBUSB_TRANSFER_CANCELLED ? "CANCELLED" : "UNKNOWN");
+        int remaining = --capActiveTransfers;
+        if (remaining <= 0) {
+            LOGE("All capture transfers failed -- stopping capture");
+            capStreaming.store(false);
+        }
+        return;
+    }
+
+    // Iso IN packets are scattered at uniform stride. We set every packet's
+    // length to capEffectiveMaxPkt at submit, so packet p starts at
+    // buffer + p * capEffectiveMaxPkt; only the first actual_length bytes are
+    // valid PCM. If the ring buffer is full (Java reader is too slow) we drop
+    // the excess silently -- capture is producer-paced and we cannot stall
+    // the USB bus.
+    for (int p = 0; p < transfer->num_iso_packets; p++) {
+        auto& pkt = transfer->iso_packet_desc[p];
+        if (pkt.status != LIBUSB_TRANSFER_COMPLETED) continue;
+        int len = pkt.actual_length;
+        if (len <= 0) continue;
+        uint8_t* src = transfer->buffer + (capEffectiveMaxPkt * p);
+        if (capRingBuffer) capRingBuffer->write(src, len);
+    }
+
+    int idx = -1;
+    for (int i = 0; i < CAP_NUM_TRANSFERS; i++) {
+        if (capTransfers[i] == transfer) { idx = i; break; }
+    }
+    if (idx < 0) {
+        int remaining = --capActiveTransfers;
+        if (remaining <= 0) {
+            LOGE("All capture transfers lost -- stopping");
+            capStreaming.store(false);
+        }
+        return;
+    }
+
+    submitCaptureTransfer(idx);
+}
+
+void UsbAudioDriver::submitCaptureTransfer(int index) {
+    if (!capStreaming.load()) return;
+    libusb_transfer* xfr = capTransfers[index];
+
+    // Re-arm each iso packet to the full advertised size; iso IN packets are
+    // device-paced and only the actual_length on completion tells us how much
+    // arrived. No data fill -- the previous callback already drained it.
+    for (int p = 0; p < CAP_PACKETS_PER_TRANSFER; p++) {
+        xfr->iso_packet_desc[p].length = capEffectiveMaxPkt;
+        xfr->iso_packet_desc[p].actual_length = 0;
+    }
+    xfr->length = capEffectiveMaxPkt * CAP_PACKETS_PER_TRANSFER;
+
+    int rc = libusb_submit_transfer(xfr);
+    if (rc < 0) {
+        LOGE("capture resubmit_transfer failed: %s", libusb_error_name(rc));
+        int remaining = --capActiveTransfers;
+        if (remaining <= 0) {
+            LOGE("All capture transfers lost on resubmit -- stopping");
+            capStreaming.store(false);
+        }
+    }
+}
+
+bool UsbAudioDriver::startCapture() {
+    if (!capConfigured || !handle) {
+        LOGE("startCapture() called but configured=%d handle=%p", capConfigured, handle);
+        return false;
+    }
+    if (capStreaming.load()) {
+        LOGI("startCapture() already running");
+        return true;
+    }
+
+    int basePktSize = capActiveFormat.maxPacketSize & 0x7FF;
+    int mult = ((capActiveFormat.maxPacketSize >> 11) & 0x03) + 1;
+    capEffectiveMaxPkt = basePktSize * mult;
+
+    bool isHighSpeed = (usbSpeed >= LIBUSB_SPEED_HIGH);
+    int bytesPerFrame = capSubslotSize * capChannels;
+    int nominalFpp = isHighSpeed ? (capRate / 8000) : (capRate / 1000);
+    int nominalBytesPerPacket = nominalFpp * bytesPerFrame;
+
+    LOGI("Starting capture: iface=%d alt=%d ep=0x%02x rate=%d ch=%d bits=%d subslot=%d "
+         "maxpkt=0x%04x(eff=%d) speed=%s fpp=%d bpp=%d UAC%d",
+         capActiveFormat.interfaceNum, capActiveFormat.altSetting, capActiveFormat.endpointAddr,
+         capRate, capChannels, capBitDepth, capSubslotSize,
+         capActiveFormat.maxPacketSize, capEffectiveMaxPkt,
+         isHighSpeed ? "High" : "Full", nominalFpp, nominalBytesPerPacket, uacVersion);
+
+    // Capture ring buffer: 200ms of capture audio (in wire-format bytes).
+    int ringSize = capRate * bytesPerFrame / 5;
+    if (ringSize < 65536) ringSize = 65536;
+    delete capRingBuffer;
+    capRingBuffer = new RingBuffer(ringSize);
+    if (mlock(capRingBuffer->getBuffer(), capRingBuffer->getCapacity()) != 0) {
+        LOGI("mlock capture ring buffer failed: %s (non-fatal)", strerror(errno));
+    }
+
+    int rc;
+    // Detach kernel driver from capture AS (and AC, if not already done by OUT).
+    if (acInterfaceNum >= 0 && !acInterfaceClaimed) {
+        rc = libusb_detach_kernel_driver(handle, acInterfaceNum);
+        LOGI("capture detach_kernel_driver(AC iface %d): %s", acInterfaceNum,
+             rc == 0 ? "OK" : libusb_error_name(rc));
+    }
+    rc = libusb_detach_kernel_driver(handle, capActiveFormat.interfaceNum);
+    LOGI("capture detach_kernel_driver(AS iface %d): %s", capActiveFormat.interfaceNum,
+         rc == 0 ? "OK" : libusb_error_name(rc));
+
+    // Claim AC interface (shared with OUT). Idempotent: skip if already held.
+    if (acInterfaceNum >= 0 && !acInterfaceClaimed) {
+        rc = libusb_claim_interface(handle, acInterfaceNum);
+        if (rc < 0) {
+            LOGI("capture claim_interface(AC %d) failed: %s (non-fatal)",
+                 acInterfaceNum, libusb_error_name(rc));
+        } else {
+            acInterfaceClaimed = true;
+        }
+    }
+
+    rc = libusb_claim_interface(handle, capActiveFormat.interfaceNum);
+    if (rc < 0) {
+        LOGE("capture claim_interface(%d) failed: %s",
+             capActiveFormat.interfaceNum, libusb_error_name(rc));
+        stopCapture();
+        return false;
+    }
+    capInterfaceClaimed = true;
+
+    libusb_set_interface_alt_setting(handle, capActiveFormat.interfaceNum, 0);
+    if (!setInterfaceAltSetting(capActiveFormat.interfaceNum, capActiveFormat.altSetting)) {
+        stopCapture();
+        return false;
+    }
+
+    // Sample rate. On UAC2 we drive the ADC's clock source; on shared-clock
+    // devices the rate was already pinned by playback and configureCapture
+    // would have rejected a mismatch.
+    int capClockId = capActiveFormat.clockSourceId >= 0
+            ? capActiveFormat.clockSourceId : clockSourceId;
+    if (uacVersion >= 2 && capClockId >= 0) {
+        bool sharedClockAlreadySet = streaming.load()
+                && capClockId == activeFormat.clockSourceId;
+        if (!sharedClockAlreadySet) {
+            if (!setSampleRateUAC2(capClockId, capRate)) {
+                LOGE("startCapture(): ADC rejected sample rate %d Hz", capRate);
+                stopCapture();
+                return false;
+            }
+        }
+    } else {
+        // UAC1 capture: best-effort endpoint SET_CUR. Some devices ignore it.
+        setSampleRate(capActiveFormat.endpointAddr, capRate);
+    }
+
+    // Allocate transfers. Buffer size uses effectiveMaxPkt because each iso IN
+    // packet may arrive at the max size; we cannot assume the nominal fpp.
+    capTransferBufSize = capEffectiveMaxPkt * CAP_PACKETS_PER_TRANSFER;
+    for (int i = 0; i < CAP_NUM_TRANSFERS; i++) {
+        capTransfers[i] = libusb_alloc_transfer(CAP_PACKETS_PER_TRANSFER);
+        if (!capTransfers[i]) {
+            LOGE("capture alloc_transfer failed");
+            stopCapture();
+            return false;
+        }
+        capTransferBuffers[i] = new uint8_t[capTransferBufSize];
+        memset(capTransferBuffers[i], 0, capTransferBufSize);
+        if (mlock(capTransferBuffers[i], capTransferBufSize) != 0) {
+            LOGI("mlock capture transfer[%d] failed: %s (non-fatal)", i, strerror(errno));
+        }
+
+        libusb_fill_iso_transfer(capTransfers[i], handle,
+            capActiveFormat.endpointAddr,
+            capTransferBuffers[i], capTransferBufSize,
+            CAP_PACKETS_PER_TRANSFER,
+            captureCallback, this, 1000);
+        libusb_set_iso_packet_lengths(capTransfers[i], capEffectiveMaxPkt);
+    }
+
+    capStreaming.store(true);
+    capActiveTransfers.store(CAP_NUM_TRANSFERS);
+
+    for (int i = 0; i < CAP_NUM_TRANSFERS; i++) {
+        rc = libusb_submit_transfer(capTransfers[i]);
+        if (rc < 0) {
+            LOGE("capture submit_transfer[%d] failed: %s", i, libusb_error_name(rc));
+            capActiveTransfers--;
+        }
+    }
+    if (capActiveTransfers.load() <= 0) {
+        LOGE("All capture transfers failed to submit");
+        capStreaming.store(false);
+        stopCapture();
+        return false;
+    }
+    LOGI("%d/%d capture transfers submitted", capActiveTransfers.load(), CAP_NUM_TRANSFERS);
+
+    ensureEventThread();
+
+    LOGI("USB audio capture started (%d transfers, ring=%d bytes)",
+         CAP_NUM_TRANSFERS, ringSize);
+    return true;
+}
+
+int UsbAudioDriver::readCapture(uint8_t* out, int maxBytes) {
+    if (!capStreaming.load() || !capRingBuffer) return -1;
+    int bytesPerFrame = capSubslotSize * capChannels;
+    if (bytesPerFrame > 0) {
+        int aligned = (maxBytes / bytesPerFrame) * bytesPerFrame;
+        if (aligned <= 0) return 0;
+        maxBytes = aligned;
+    }
+    return (int)capRingBuffer->read(out, maxBytes);
+}
+
+void UsbAudioDriver::stopCapture() {
+    if (!capStreaming.load() && capActiveTransfers.load() == 0
+            && !capInterfaceClaimed && capTransferBuffers[0] == nullptr) {
+        // Already torn down -- avoid double-release of the event thread refcount.
+        return;
+    }
+    bool wasStreaming = capStreaming.exchange(false);
+
+    if (ctx) {
+        for (int retry = 0; retry < 50 && capActiveTransfers.load() > 0; retry++) {
+            struct timeval tv = {0, 10000};
+            libusb_handle_events_timeout_completed(ctx, &tv, nullptr);
+        }
+        for (int i = 0; i < CAP_NUM_TRANSFERS; i++) {
+            if (capTransfers[i]) libusb_cancel_transfer(capTransfers[i]);
+        }
+        for (int retry = 0; retry < 30 && capActiveTransfers.load() > 0; retry++) {
+            struct timeval tv = {0, 5000};
+            libusb_handle_events_timeout_completed(ctx, &tv, nullptr);
+        }
+    }
+
+    for (int i = 0; i < CAP_NUM_TRANSFERS; i++) {
+        if (capTransfers[i]) {
+            libusb_free_transfer(capTransfers[i]);
+            capTransfers[i] = nullptr;
+        }
+        if (capTransferBuffers[i]) {
+            if (capTransferBufSize > 0) {
+                munlock(capTransferBuffers[i], capTransferBufSize);
+            }
+            delete[] capTransferBuffers[i];
+            capTransferBuffers[i] = nullptr;
+        }
+    }
+    capTransferBufSize = 0;
+
+    if (handle && capInterfaceClaimed) {
+        libusb_set_interface_alt_setting(handle, capActiveFormat.interfaceNum, 0);
+        libusb_release_interface(handle, capActiveFormat.interfaceNum);
+        capInterfaceClaimed = false;
+    }
+    // AC interface is shared with playback -- keep it claimed while OUT runs.
+    if (handle && acInterfaceClaimed && !streaming.load()) {
+        libusb_release_interface(handle, acInterfaceNum);
+        acInterfaceClaimed = false;
+    }
+
+    if (capRingBuffer) {
+        munlock(capRingBuffer->getBuffer(), capRingBuffer->getCapacity());
+        delete capRingBuffer;
+        capRingBuffer = nullptr;
+    }
+
+    capActiveTransfers.store(0);
+
+    if (wasStreaming) {
+        releaseEventThread();
+    }
+
+    LOGI("USB audio capture stopped");
+}
+
+void UsbAudioDriver::close() {
+    LOGI("close() called, streaming=%d capStreaming=%d opened=%d",
+         streaming.load() ? 1 : 0, capStreaming.load() ? 1 : 0, opened);
+
+    if (capStreaming.load()) {
+        stopCapture();
+    }
     if (streaming.load()) {
         stop();
     }

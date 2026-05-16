@@ -122,7 +122,7 @@ private:
 struct UsbAudioFormat {
     int interfaceNum;
     int altSetting;
-    int endpointAddr;
+    int endpointAddr;       // iso data EP (OUT when isCapture==false, IN when isCapture==true)
     int maxPacketSize;
     int sampleRate;
     int channels;
@@ -130,7 +130,8 @@ struct UsbAudioFormat {
     int subslotSize;    // bSubslotSize: bytes on the wire per sample (>= bitDepth/8)
     uint32_t bmFormats = 0;  // UAC2 AS_GENERAL bmFormats bitmap (bit 31 = RAW_DATA / DSD)
     bool isDsd = false;      // True when this alt-setting is the DSD variant
-    int feedbackEpAddr = -1;
+    bool isCapture = false;  // True when this alt-setting feeds data IN from the device (ADC/mic)
+    int feedbackEpAddr = -1; // Iso IN feedback EP for playback alt-settings; -1 for capture
     int clockSourceId = -1;  // Resolved via AS_GENERAL.bTerminalLink -> Terminal.bCSourceID
 };
 
@@ -171,6 +172,18 @@ public:
     bool setHwMute(bool muted);
     void setSoftwareGain(float gain) { softwareGain.store(gain, std::memory_order_relaxed); }
 
+    // --- Capture (ADC -> host) ---
+    bool configureCapture(int sampleRate, int channels, int bitDepth);
+    bool startCapture();
+    int  readCapture(uint8_t* out, int maxBytes);
+    void stopCapture();
+    int  getConfiguredCaptureRate() const        { return capRate; }
+    int  getConfiguredCaptureChannels() const    { return capChannels; }
+    int  getConfiguredCaptureBitDepth() const    { return capBitDepth; }
+    int  getConfiguredCaptureSubslotSize() const { return capSubslotSize; }
+    bool isCapturing() const                     { return capStreaming.load(); }
+    bool hasCaptureFormats() const;
+
 private:
     bool setInterfaceAltSetting(int interface_num, int alt_setting);
     bool setSampleRate(int endpoint, int rate);
@@ -184,6 +197,13 @@ private:
     static void feedbackCallback(struct libusb_transfer* transfer);
     void handleFeedbackComplete(struct libusb_transfer* transfer);
     void submitFeedbackTransfer();
+
+    static void captureCallback(struct libusb_transfer* transfer);
+    void handleCaptureComplete(struct libusb_transfer* transfer);
+    void submitCaptureTransfer(int index);
+
+    void ensureEventThread();
+    void releaseEventThread();
 
     libusb_context* ctx = nullptr;
     libusb_device_handle* handle = nullptr;
@@ -228,10 +248,32 @@ private:
 
     std::atomic<bool> streaming{false};
     std::thread eventThread;
+    std::atomic<int> eventThreadUsers{0};
     bool opened = false;
     bool configured = false;
     bool interfaceClaimed = false;
     bool acInterfaceClaimed = false;
+
+    // --- Capture-side mirror of OUT pipeline ---
+    UsbAudioFormat capActiveFormat{};
+    int capRate = 0;
+    int capChannels = 0;
+    int capBitDepth = 0;
+    int capSubslotSize = 0;
+    int capEffectiveMaxPkt = 0;
+
+    static const int CAP_NUM_TRANSFERS = 8;
+    static const int CAP_PACKETS_PER_TRANSFER = 8;
+    struct libusb_transfer* capTransfers[CAP_NUM_TRANSFERS] = {};
+    uint8_t* capTransferBuffers[CAP_NUM_TRANSFERS] = {};
+    int capTransferBufSize = 0;
+    std::atomic<int> capActiveTransfers{0};
+
+    RingBuffer* capRingBuffer = nullptr;
+
+    std::atomic<bool> capStreaming{false};
+    bool capInterfaceClaimed = false;
+    bool capConfigured = false;
 };
 
 #endif // USB_AUDIO_H

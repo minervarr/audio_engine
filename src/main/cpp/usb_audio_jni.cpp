@@ -252,4 +252,71 @@ Java_com_nerio_audioengine_UsbAudioNative_nativeSetSoftwareGain(JNIEnv*, jclass,
     if (driver) driver->setSoftwareGain((float)gain);
 }
 
+// --- Capture (ADC -> host) ---
+
+JNIEXPORT jboolean JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeConfigureCapture(JNIEnv*, jclass,
+        jlong handle, jint sampleRate, jint channels, jint bitDepth) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return JNI_FALSE;
+    return driver->configureCapture(sampleRate, channels, bitDepth) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeStartCapture(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return JNI_FALSE;
+    return driver->startCapture() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeReadCapture(JNIEnv* env, jclass,
+        jlong handle, jbyteArray buf, jint offset, jint maxLen) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return -1;
+    jbyte* bytes = env->GetByteArrayElements(buf, nullptr);
+    if (!bytes) return -1;
+    int got = driver->readCapture(
+            reinterpret_cast<uint8_t*>(bytes + offset), maxLen);
+    // Mode 0 (commit) -- captured data must be copied back to the Java array.
+    env->ReleaseByteArrayElements(buf, bytes, 0);
+    return got;
+}
+
+JNIEXPORT void JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeStopCapture(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (driver) driver->stopCapture();
+}
+
+JNIEXPORT jint JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetConfiguredCaptureRate(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    return driver ? driver->getConfiguredCaptureRate() : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetConfiguredCaptureChannels(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    return driver ? driver->getConfiguredCaptureChannels() : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetConfiguredCaptureBitDepth(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    return driver ? driver->getConfiguredCaptureBitDepth() : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetConfiguredCaptureSubslotSize(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    return driver ? driver->getConfiguredCaptureSubslotSize() : 0;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeHasCaptureFormats(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    return (driver && driver->hasCaptureFormats()) ? JNI_TRUE : JNI_FALSE;
+}
+
 } // extern "C"
