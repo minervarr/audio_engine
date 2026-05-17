@@ -16,6 +16,10 @@
 #define LOG_TAG "UsbAudio"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+// Per-descriptor / per-format enumeration logs use LOGD so they're suppressed
+// by default. Bump the logcat tag filter to `UsbAudio:D` when debugging
+// descriptor parsing or format selection.
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 UsbAudioDriver::UsbAudioDriver() = default;
 
@@ -91,6 +95,10 @@ bool UsbAudioDriver::parseDescriptors() {
     // Terminal IDs that represent physical audio entering the function
     // (Microphone 0x0201..0x0205, External 0x0601..0x0603, etc.) -- capture sources.
     std::unordered_map<int, bool> isCaptureSourceIT;
+    // Output Terminals in the 0x01xx (USB function) category -- i.e. the host-side
+    // sinks that stream captured audio back out via USB. Capture AudioStreaming
+    // interfaces set bTerminalLink to one of these, NOT to the physical IT.
+    std::unordered_map<int, bool> isUsbStreamingOT;
     struct FuCandidate { int unitId; int sourceId; bool hasVolume; bool hasMute; };
     std::vector<FuCandidate> featureUnits;
     volumeFuUnitId = -1;
@@ -130,7 +138,7 @@ bool UsbAudioDriver::parseDescriptors() {
                                 == clockSourceIds.end()) {
                             clockSourceIds.push_back(csId);
                         }
-                        LOGI("UAC2 Clock Source ID: %d", csId);
+                        LOGD("UAC2 Clock Source ID: %d", csId);
                     }
                     // UAC2 Input Terminal (data flowing INTO audio function): bCSourceID at offset 7
                     if (uacVersion == 2 && subType == UAC_INPUT_TERMINAL && descLen >= 8) {
@@ -148,14 +156,22 @@ bool UsbAudioDriver::parseDescriptors() {
                         } else if ((termType & 0xFF00) != 0x0100) {
                             isCaptureSourceIT[termId] = true;
                         }
-                        LOGI("UAC2 Input Terminal %d (type 0x%04x) -> Clock %d", termId, termType, csId);
+                        LOGD("UAC2 Input Terminal %d (type 0x%04x) -> Clock %d", termId, termType, csId);
                     }
                     // UAC2 Output Terminal (data flowing OUT of audio function): bCSourceID at offset 8
                     if (uacVersion == 2 && subType == UAC_OUTPUT_TERMINAL && descLen >= 9) {
                         int termId = extra[pos + 3];
+                        int termType = extra[pos + 4] | (extra[pos + 5] << 8);
                         int csId = extra[pos + 8];
                         terminalToClock[termId] = csId;
-                        LOGI("UAC2 Output Terminal %d -> Clock %d", termId, csId);
+                        // OTs in the 0x01xx category stream data back to the host
+                        // (USB Streaming = 0x0101, etc.). A capture AS interface's
+                        // bTerminalLink points to one of these.
+                        if ((termType & 0xFF00) == 0x0100) {
+                            isUsbStreamingOT[termId] = true;
+                        }
+                        LOGD("UAC2 Output Terminal %d (type 0x%04x) -> Clock %d",
+                             termId, termType, csId);
                     }
                     // UAC2 Feature Unit: layout [3]=bUnitID [4]=bSourceID
                     // [5..]=bmaControls[N+1] (4 bytes per channel, master first).
@@ -172,7 +188,7 @@ bool UsbAudioDriver::parseDescriptors() {
                         fu.hasMute = ((masterCtrls >> 0) & 0x3) != 0;
                         fu.hasVolume = ((masterCtrls >> 2) & 0x3) != 0;
                         featureUnits.push_back(fu);
-                        LOGI("UAC2 Feature Unit %d <- src %d ctrls=0x%08x vol=%d mute=%d",
+                        LOGD("UAC2 Feature Unit %d <- src %d ctrls=0x%08x vol=%d mute=%d",
                              fu.unitId, fu.sourceId, masterCtrls, fu.hasVolume, fu.hasMute);
                     }
                     // UAC1 Feature Unit: layout [3]=bUnitID [4]=bSourceID
@@ -189,7 +205,7 @@ bool UsbAudioDriver::parseDescriptors() {
                             fu.hasVolume = (masterCtrls & 0x02) != 0;
                         }
                         featureUnits.push_back(fu);
-                        LOGI("UAC1 Feature Unit %d <- src %d vol=%d mute=%d",
+                        LOGD("UAC1 Feature Unit %d <- src %d vol=%d mute=%d",
                              fu.unitId, fu.sourceId, fu.hasVolume, fu.hasMute);
                     }
                 }
@@ -355,9 +371,14 @@ bool UsbAudioDriver::parseDescriptors() {
             // data and there is no async feedback EP (capture is source-clocked).
             // Without a positive capture hint we keep legacy behavior: iso OUT is
             // data, iso IN is feedback.
+            // A capture AS interface's bTerminalLink points to the host-side
+            // streaming OT (e.g. type 0x0101). Some non-standard firmware points
+            // it straight at the physical capture IT (Mic 0x02xx etc.) -- accept
+            // that too for robustness.
             bool isCaptureAs = false;
             if (uacVersion >= 2 && bTerminalLink > 0
-                    && isCaptureSourceIT.count(bTerminalLink)) {
+                    && (isUsbStreamingOT.count(bTerminalLink)
+                            || isCaptureSourceIT.count(bTerminalLink))) {
                 isCaptureAs = true;
             }
 
@@ -451,7 +472,7 @@ bool UsbAudioDriver::parseDescriptors() {
 
     LOGI("Parsed %zu format(s), UAC%d", formats.size(), uacVersion);
     for (auto& f : formats) {
-        LOGI("  iface=%d alt=%d ep=0x%02x rate=%d ch=%d bits=%d subslot=%d bmFormats=0x%08x dsd=%d cap=%d clk=%d maxpkt=0x%04x fb=0x%02x",
+        LOGD("  iface=%d alt=%d ep=0x%02x rate=%d ch=%d bits=%d subslot=%d bmFormats=0x%08x dsd=%d cap=%d clk=%d maxpkt=0x%04x fb=0x%02x",
              f.interfaceNum, f.altSetting, f.endpointAddr,
              f.sampleRate, f.channels, f.bitDepth, f.subslotSize,
              f.bmFormats, f.isDsd ? 1 : 0, f.isCapture ? 1 : 0, f.clockSourceId,
@@ -548,7 +569,7 @@ bool UsbAudioDriver::setSampleRateUAC2(int clockId, int rate) {
             LOGE("UAC2: clock reports INVALID after rate change");
         }
     } else {
-        LOGI("UAC2: clock valid query not supported (rc=%d), continuing", rc);
+        LOGD("UAC2: clock valid query not supported (rc=%d), continuing", rc);
     }
 
     return true;
@@ -708,7 +729,7 @@ std::vector<int> UsbAudioDriver::queryUac2SampleRates(int clockId) {
         return result;
     }
 
-    LOGI("UAC2 Clock %d: %d sub-range(s)", clockId, (int)numSubRanges);
+    LOGD("UAC2 Clock %d: %d sub-range(s)", clockId, (int)numSubRanges);
     const int commonRates[] = {44100, 48000, 88200, 96000, 176400, 192000,
                                352800, 384000, 705600, 768000};
     for (int i = 0; i < numSubRanges; i++) {
@@ -725,7 +746,7 @@ std::vector<int> UsbAudioDriver::queryUac2SampleRates(int clockId) {
                       | ((uint32_t)buf[off + 9] << 8)
                       | ((uint32_t)buf[off + 10] << 16)
                       | ((uint32_t)buf[off + 11] << 24);
-        LOGI("  sub-range %d: min=%u max=%u res=%u", i, dMin, dMax, dRes);
+        LOGD("  sub-range %d: min=%u max=%u res=%u", i, dMin, dMax, dRes);
 
         if (dMin == dMax) {
             // Singleton sub-range: a single discrete fixed rate.
@@ -1034,9 +1055,9 @@ bool UsbAudioDriver::start() {
 
     // Lock ring buffer pages to prevent page faults during streaming
     if (mlock(ringBuffer->getBuffer(), ringBuffer->getCapacity()) != 0) {
-        LOGI("mlock ring buffer failed: %s (non-fatal)", strerror(errno));
+        LOGD("mlock ring buffer failed: %s (non-fatal)", strerror(errno));
     } else {
-        LOGI("mlock ring buffer: %zu bytes locked", ringBuffer->getCapacity());
+        LOGD("mlock ring buffer: %zu bytes locked", ringBuffer->getCapacity());
     }
 
     // Detach kernel driver from both Audio Control and Streaming interfaces
@@ -1550,6 +1571,42 @@ bool UsbAudioDriver::hasCaptureFormats() const {
     return false;
 }
 
+std::vector<int> UsbAudioDriver::getCaptureRates() const {
+    std::vector<int> out;
+    for (auto& f : formats) {
+        if (!f.isCapture) continue;
+        if (std::find(out.begin(), out.end(), f.sampleRate) == out.end()) {
+            out.push_back(f.sampleRate);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::vector<int> UsbAudioDriver::getCaptureBitDepths() const {
+    std::vector<int> out;
+    for (auto& f : formats) {
+        if (!f.isCapture) continue;
+        if (std::find(out.begin(), out.end(), f.bitDepth) == out.end()) {
+            out.push_back(f.bitDepth);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::vector<int> UsbAudioDriver::getCaptureChannelCounts() const {
+    std::vector<int> out;
+    for (auto& f : formats) {
+        if (!f.isCapture) continue;
+        if (std::find(out.begin(), out.end(), f.channels) == out.end()) {
+            out.push_back(f.channels);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 bool UsbAudioDriver::configureCapture(int sampleRate, int channels, int bitDepth) {
     if (!opened) {
         LOGE("configureCapture() called but not opened");
@@ -1560,7 +1617,7 @@ bool UsbAudioDriver::configureCapture(int sampleRate, int channels, int bitDepth
         stopCapture();
     }
 
-    LOGI("configureCapture requested: rate=%d ch=%d bits=%d", sampleRate, channels, bitDepth);
+    LOGD("configureCapture requested: rate=%d ch=%d bits=%d", sampleRate, channels, bitDepth);
 
     // Two-pass match on capture-only alts.
     UsbAudioFormat* best = nullptr;
@@ -1611,7 +1668,7 @@ bool UsbAudioDriver::configureCapture(int sampleRate, int channels, int bitDepth
     capSubslotSize = (best->subslotSize > 0) ? best->subslotSize : ((best->bitDepth + 7) / 8);
     capConfigured = true;
 
-    LOGI("Configured capture: rate=%d ch=%d bits=%d subslot=%d iface=%d alt=%d ep=0x%02x clk=%d",
+    LOGD("Configured capture: rate=%d ch=%d bits=%d subslot=%d iface=%d alt=%d ep=0x%02x clk=%d",
          capRate, capChannels, capBitDepth, capSubslotSize,
          capActiveFormat.interfaceNum, capActiveFormat.altSetting,
          capActiveFormat.endpointAddr, capActiveFormat.clockSourceId);
@@ -1732,7 +1789,7 @@ bool UsbAudioDriver::startCapture() {
     delete capRingBuffer;
     capRingBuffer = new RingBuffer(ringSize);
     if (mlock(capRingBuffer->getBuffer(), capRingBuffer->getCapacity()) != 0) {
-        LOGI("mlock capture ring buffer failed: %s (non-fatal)", strerror(errno));
+        LOGD("mlock capture ring buffer failed: %s (non-fatal)", strerror(errno));
     }
 
     int rc;
@@ -1805,7 +1862,7 @@ bool UsbAudioDriver::startCapture() {
         capTransferBuffers[i] = new uint8_t[capTransferBufSize];
         memset(capTransferBuffers[i], 0, capTransferBufSize);
         if (mlock(capTransferBuffers[i], capTransferBufSize) != 0) {
-            LOGI("mlock capture transfer[%d] failed: %s (non-fatal)", i, strerror(errno));
+            LOGD("mlock capture transfer[%d] failed: %s (non-fatal)", i, strerror(errno));
         }
 
         libusb_fill_iso_transfer(capTransfers[i], handle,

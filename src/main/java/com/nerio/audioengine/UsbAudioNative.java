@@ -42,4 +42,7 @@ public class UsbAudioNative {
     public static native int nativeGetConfiguredCaptureBitDepth(long handle);
     public static native int nativeGetConfiguredCaptureSubslotSize(long handle);
     public static native boolean nativeHasCaptureFormats(long handle);
+    public static native int[] nativeGetSupportedCaptureRates(long handle);
+    public static native int[] nativeGetSupportedCaptureBitDepths(long handle);
+    public static native int[] nativeGetSupportedCaptureChannelCounts(long handle);
 }

@@ -1,4 +1,4 @@
-# Install script for directory: C:/Users/incxiuefb/Documents/Files/clone/media_player/audioengine/src/main/cpp
+# Install script for directory: C:/Users/incxiuefb/Documents/Files/clone/audio_recorder/audioengine/src/main/cpp
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
@@ -50,5 +50,5 @@ endif()
 
 string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT
        "${CMAKE_INSTALL_MANIFEST_FILES}")
-file(WRITE "C:/Users/incxiuefb/Documents/Files/clone/media_player/audioengine/.cxx/Debug/225s6l69/arm64-v8a/${CMAKE_INSTALL_MANIFEST}"
+file(WRITE "C:/Users/incxiuefb/Documents/Files/clone/audio_recorder/audioengine/.cxx/Debug/225s6l69/arm64-v8a/${CMAKE_INSTALL_MANIFEST}"
      "${CMAKE_INSTALL_MANIFEST_CONTENT}")

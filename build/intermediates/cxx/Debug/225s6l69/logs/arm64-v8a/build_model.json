@@ -8,9 +8,9 @@
     "triple": "aarch64-linux-android",
     "llvmTriple": "aarch64-none-linux-android"
   },
-  "cxxBuildFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\.cxx\\Debug\\225s6l69\\arm64-v8a",
-  "soFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\build\\intermediates\\cxx\\Debug\\225s6l69\\obj\\arm64-v8a",
-  "soRepublishFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\build\\intermediates\\cmake\\debug\\obj\\arm64-v8a",
+  "cxxBuildFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\.cxx\\Debug\\225s6l69\\arm64-v8a",
+  "soFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\build\\intermediates\\cxx\\Debug\\225s6l69\\obj\\arm64-v8a",
+  "soRepublishFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\build\\intermediates\\cmake\\debug\\obj\\arm64-v8a",
   "abiPlatformVersion": 24,
   "cmake": {
     "effectiveConfiguration": {
@@ -36,13 +36,13 @@
     "implicitBuildTargetSet": [],
     "cmakeSettingsConfiguration": "android-gradle-plugin-predetermined-name",
     "module": {
-      "cxxFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\.cxx",
-      "intermediatesBaseFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\build\\intermediates",
-      "intermediatesFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\build\\intermediates\\cxx",
+      "cxxFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\.cxx",
+      "intermediatesBaseFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\build\\intermediates",
+      "intermediatesFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\build\\intermediates\\cxx",
       "gradleModulePathName": ":audioengine",
-      "moduleRootFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine",
-      "moduleBuildFile": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\build.gradle",
-      "makeFile": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\src\\main\\cpp\\CMakeLists.txt",
+      "moduleRootFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine",
+      "moduleBuildFile": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\build.gradle",
+      "makeFile": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\src\\main\\cpp\\CMakeLists.txt",
       "buildSystem": "CMAKE",
       "ndkFolder": "C:\\PPProgam\\android_sdk\\ndk\\28.2.13676358",
       "ndkFolderBeforeSymLinking": "C:\\PPProgam\\android_sdk\\ndk\\28.2.13676358",
@@ -153,7 +153,7 @@
         "SYSTEM": {}
       },
       "project": {
-        "rootBuildGradleFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player",
+        "rootBuildGradleFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder",
         "sdkFolder": "C:\\PPProgam\\android_sdk",
         "isBuildOnlyTargetAbiEnabled": true,
         "isCmakeBuildCohabitationEnabled": false,
@@ -172,12 +172,12 @@
   "buildSettings": {
     "environmentVariables": []
   },
-  "prefabFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\.cxx\\Debug\\225s6l69\\prefab\\arm64-v8a",
+  "prefabFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\.cxx\\Debug\\225s6l69\\prefab\\arm64-v8a",
   "isActiveAbi": true,
   "fullConfigurationHash": "225s6l69263z1af5e344s6k681d6n1z6t33q192s4w1t2f4d47204a4i5s4r54",
   "fullConfigurationHashKey": "# Values used to calculate the hash in this folder name.\n# Should not depend on the absolute path of the project itself.\n#   - AGP: 9.0.1.\n#   - $NDK is the path to NDK 28.2.13676358.\n#   - $PROJECT is the path to the parent folder of the root Gradle build file.\n#   - $ABI is the ABI to be built with. The specific value doesn\u0027t contribute to the value of the hash.\n#   - $HASH is the hash value computed from this text.\n#   - $CMAKE is the path to CMake 3.22.1.\n#   - $NINJA is the path to Ninja.\n-H$PROJECT/audioengine/src/main/cpp\n-DCMAKE_SYSTEM_NAME\u003dAndroid\n-DCMAKE_EXPORT_COMPILE_COMMANDS\u003dON\n-DCMAKE_SYSTEM_VERSION\u003d24\n-DANDROID_PLATFORM\u003dandroid-24\n-DANDROID_ABI\u003d$ABI\n-DCMAKE_ANDROID_ARCH_ABI\u003d$ABI\n-DANDROID_NDK\u003d$NDK\n-DCMAKE_ANDROID_NDK\u003d$NDK\n-DCMAKE_TOOLCHAIN_FILE\u003d$NDK/build/cmake/android.toolchain.cmake\n-DCMAKE_MAKE_PROGRAM\u003d$NINJA\n-DCMAKE_CXX_FLAGS\u003d-std\u003dc++17\n-DCMAKE_LIBRARY_OUTPUT_DIRECTORY\u003d$PROJECT/audioengine/build/intermediates/cxx/Debug/$HASH/obj/$ABI\n-DCMAKE_RUNTIME_OUTPUT_DIRECTORY\u003d$PROJECT/audioengine/build/intermediates/cxx/Debug/$HASH/obj/$ABI\n-DCMAKE_BUILD_TYPE\u003dDebug\n-B$PROJECT/audioengine/.cxx/Debug/$HASH/$ABI\n-GNinja",
   "configurationArguments": [
-    "-HC:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\src\\main\\cpp",
+    "-HC:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\src\\main\\cpp",
     "-DCMAKE_SYSTEM_NAME\u003dAndroid",
     "-DCMAKE_EXPORT_COMPILE_COMMANDS\u003dON",
     "-DCMAKE_SYSTEM_VERSION\u003d24",
@@ -189,11 +189,11 @@
     "-DCMAKE_TOOLCHAIN_FILE\u003dC:\\PPProgam\\android_sdk\\ndk\\28.2.13676358\\build\\cmake\\android.toolchain.cmake",
     "-DCMAKE_MAKE_PROGRAM\u003dC:\\PPProgam\\android_sdk\\cmake\\3.22.1\\bin\\ninja.exe",
     "-DCMAKE_CXX_FLAGS\u003d-std\u003dc++17",
-    "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY\u003dC:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\build\\intermediates\\cxx\\Debug\\225s6l69\\obj\\arm64-v8a",
-    "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY\u003dC:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\build\\intermediates\\cxx\\Debug\\225s6l69\\obj\\arm64-v8a",
+    "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY\u003dC:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\build\\intermediates\\cxx\\Debug\\225s6l69\\obj\\arm64-v8a",
+    "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY\u003dC:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\build\\intermediates\\cxx\\Debug\\225s6l69\\obj\\arm64-v8a",
     "-DCMAKE_BUILD_TYPE\u003dDebug",
-    "-BC:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\.cxx\\Debug\\225s6l69\\arm64-v8a",
+    "-BC:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\.cxx\\Debug\\225s6l69\\arm64-v8a",
     "-GNinja"
   ],
-  "intermediatesParentFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\build\\intermediates\\cxx\\Debug\\225s6l69"
+  "intermediatesParentFolder": "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\build\\intermediates\\cxx\\Debug\\225s6l69"
 }

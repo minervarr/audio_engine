@@ -1,6 +1,6 @@
 @echo off
 "C:\\PPProgam\\android_sdk\\cmake\\3.22.1\\bin\\cmake.exe" ^
-  "-HC:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\src\\main\\cpp" ^
+  "-HC:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\src\\main\\cpp" ^
   "-DCMAKE_SYSTEM_NAME=Android" ^
   "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON" ^
   "-DCMAKE_SYSTEM_VERSION=24" ^
@@ -12,8 +12,8 @@
   "-DCMAKE_TOOLCHAIN_FILE=C:\\PPProgam\\android_sdk\\ndk\\28.2.13676358\\build\\cmake\\android.toolchain.cmake" ^
   "-DCMAKE_MAKE_PROGRAM=C:\\PPProgam\\android_sdk\\cmake\\3.22.1\\bin\\ninja.exe" ^
   "-DCMAKE_CXX_FLAGS=-std=c++17" ^
-  "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\build\\intermediates\\cxx\\Debug\\225s6l69\\obj\\armeabi-v7a" ^
-  "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\build\\intermediates\\cxx\\Debug\\225s6l69\\obj\\armeabi-v7a" ^
+  "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=C:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\build\\intermediates\\cxx\\Debug\\225s6l69\\obj\\armeabi-v7a" ^
+  "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=C:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\build\\intermediates\\cxx\\Debug\\225s6l69\\obj\\armeabi-v7a" ^
   "-DCMAKE_BUILD_TYPE=Debug" ^
-  "-BC:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\.cxx\\Debug\\225s6l69\\armeabi-v7a" ^
+  "-BC:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\.cxx\\Debug\\225s6l69\\armeabi-v7a" ^
   -GNinja

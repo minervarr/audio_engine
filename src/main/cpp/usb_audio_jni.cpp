@@ -319,4 +319,33 @@ Java_com_nerio_audioengine_UsbAudioNative_nativeHasCaptureFormats(JNIEnv*, jclas
     return (driver && driver->hasCaptureFormats()) ? JNI_TRUE : JNI_FALSE;
 }
 
+static jintArray vecToJArray(JNIEnv* env, const std::vector<int>& v) {
+    jintArray result = env->NewIntArray(static_cast<jsize>(v.size()));
+    if (result && !v.empty()) {
+        env->SetIntArrayRegion(result, 0, static_cast<jsize>(v.size()), v.data());
+    }
+    return result;
+}
+
+JNIEXPORT jintArray JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetSupportedCaptureRates(JNIEnv* env, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return env->NewIntArray(0);
+    return vecToJArray(env, driver->getCaptureRates());
+}
+
+JNIEXPORT jintArray JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetSupportedCaptureBitDepths(JNIEnv* env, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return env->NewIntArray(0);
+    return vecToJArray(env, driver->getCaptureBitDepths());
+}
+
+JNIEXPORT jintArray JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetSupportedCaptureChannelCounts(JNIEnv* env, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return env->NewIntArray(0);
+    return vecToJArray(env, driver->getCaptureChannelCounts());
+}
+
 } // extern "C"

@@ -37,6 +37,7 @@ public class UsbAudioInput {
     private volatile boolean recording;
     private RandomAccessFile wavFile;
     private long bytesWritten;
+    private volatile UsbAudioOutput monitorOut;
 
     UsbAudioInput(long nativeHandle, UsbAudioDevice owner) {
         this.nativeHandle = nativeHandle;
@@ -46,6 +47,27 @@ public class UsbAudioInput {
     /** Returns true if the connected device exposes any capture-direction alt-settings. */
     public boolean isAvailable() {
         return nativeHandle != 0 && UsbAudioNative.nativeHasCaptureFormats(nativeHandle);
+    }
+
+    /** Sample rates exposed by the device's capture-direction alt-settings. */
+    public int[] getSupportedRates() {
+        return nativeHandle != 0
+                ? UsbAudioNative.nativeGetSupportedCaptureRates(nativeHandle)
+                : new int[0];
+    }
+
+    /** Bit depths exposed by the device's capture-direction alt-settings. */
+    public int[] getSupportedBitDepths() {
+        return nativeHandle != 0
+                ? UsbAudioNative.nativeGetSupportedCaptureBitDepths(nativeHandle)
+                : new int[0];
+    }
+
+    /** Channel counts exposed by the device's capture-direction alt-settings. */
+    public int[] getSupportedChannelCounts() {
+        return nativeHandle != 0
+                ? UsbAudioNative.nativeGetSupportedCaptureChannelCounts(nativeHandle)
+                : new int[0];
     }
 
     public boolean configure(int sampleRate, int channelCount, int requestedBitDepth) {
@@ -79,6 +101,16 @@ public class UsbAudioInput {
     /** Read raw wire-format PCM directly. Returns -1 if not capturing, 0 if no data ready. */
     public int read(byte[] buf, int offset, int maxLen) {
         return UsbAudioNative.nativeReadCapture(nativeHandle, buf, offset, maxLen);
+    }
+
+    /**
+     * Routes a copy of every captured PCM block written to the WAV into {@code out}
+     * for live monitoring through a {@link UsbAudioOutput} configured at the same
+     * rate / channels / bit-depth. Pass {@code null} to disable. The output must
+     * already be configured and started; this class does not own its lifecycle.
+     */
+    public void setMonitorOutput(UsbAudioOutput out) {
+        this.monitorOut = out;
     }
 
     public void stop() {
@@ -152,7 +184,11 @@ public class UsbAudioInput {
         final byte[] wireBuf = new byte[POLL_BUFFER_BYTES];
         final byte[] packedBuf = stripPadding ? new byte[POLL_BUFFER_BYTES] : null;
 
-        while (recording) {
+        // Keep reading until the native ring buffer is empty AND `recording` is false
+        // (drain phase) — only then exit. nativeReadCapture only returns -1 once
+        // nativeStopCapture has torn the ring buffer down, which doesn't happen until
+        // input.stop() runs after this thread joins.
+        while (true) {
             int got = UsbAudioNative.nativeReadCapture(
                     nativeHandle, wireBuf, 0, wireBuf.length);
             if (got < 0) {
@@ -160,6 +196,7 @@ public class UsbAudioInput {
                 break;
             }
             if (got == 0) {
+                if (!recording) break;
                 try {
                     Thread.sleep(IDLE_POLL_SLEEP_MS);
                 } catch (InterruptedException e) {
@@ -169,14 +206,26 @@ public class UsbAudioInput {
                 continue;
             }
             try {
+                final byte[] outBuf;
+                final int outLen;
                 if (stripPadding) {
-                    int outLen = stripSubslotPadding(
+                    outLen = stripSubslotPadding(
                             wireBuf, got, packedBuf, subslot, outBytesPerSample);
-                    wavFile.write(packedBuf, 0, outLen);
-                    bytesWritten += outLen;
+                    outBuf = packedBuf;
                 } else {
-                    wavFile.write(wireBuf, 0, got);
-                    bytesWritten += got;
+                    outLen = got;
+                    outBuf = wireBuf;
+                }
+                wavFile.write(outBuf, 0, outLen);
+                bytesWritten += outLen;
+                UsbAudioOutput mo = monitorOut;
+                if (mo != null) {
+                    try {
+                        mo.write(outBuf, 0, outLen);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "monitor write failed; dropping monitor", t);
+                        monitorOut = null;
+                    }
                 }
             } catch (IOException e) {
                 Log.e(TAG, "wav write failed", e);

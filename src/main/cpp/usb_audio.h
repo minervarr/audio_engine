@@ -183,6 +183,9 @@ public:
     int  getConfiguredCaptureSubslotSize() const { return capSubslotSize; }
     bool isCapturing() const                     { return capStreaming.load(); }
     bool hasCaptureFormats() const;
+    std::vector<int> getCaptureRates() const;
+    std::vector<int> getCaptureBitDepths() const;
+    std::vector<int> getCaptureChannelCounts() const;
 
 private:
     bool setInterfaceAltSetting(int interface_num, int alt_setting);
