@@ -160,6 +160,18 @@ Java_com_nerio_audioengine_UsbAudioNative_nativeGetConfiguredBitDepth(JNIEnv*, j
 }
 
 JNIEXPORT jint JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetConfiguredRate(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    return driver ? driver->getConfiguredRate() : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetConfiguredChannels(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    return driver ? driver->getConfiguredChannels() : 0;
+}
+
+JNIEXPORT jint JNICALL
 Java_com_nerio_audioengine_UsbAudioNative_nativeGetConfiguredSubslotSize(JNIEnv*, jclass, jlong handle) {
     auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
     return driver ? driver->getConfiguredSubslotSize() : 0;

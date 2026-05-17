@@ -216,6 +216,16 @@ public class UsbAudioOutput implements AudioOutput {
         return UsbAudioNative.nativeGetConfiguredSubslotSize(nativeHandle);
     }
 
+    public int getConfiguredRate() {
+        if (nativeHandle == 0) return 0;
+        return UsbAudioNative.nativeGetConfiguredRate(nativeHandle);
+    }
+
+    public int getConfiguredChannels() {
+        if (nativeHandle == 0) return 0;
+        return UsbAudioNative.nativeGetConfiguredChannels(nativeHandle);
+    }
+
     private boolean tryConfigureDsd(int dsdRate, int channelCount, DsdMode mode) {
         int rate, bits, encoding;
         boolean preferDsdAlt;

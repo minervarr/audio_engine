@@ -1320,10 +1320,13 @@ int UsbAudioDriver::writeInt16(const int16_t* data, int numSamples) {
     if (!streaming.load() || !ringBuffer) return -1;
 
     // Upscale 16-bit data into the DAC's wire format. The data is left-aligned
-    // within the subslot (per UAC2: padding at LSB end).
+    // within the subslot (per UAC2: padding at LSB end). When the subslot is
+    // narrower than the source (e.g. 8-bit DAC), shift right so the signal's
+    // MSBs survive in the output and only the LSBs are truncated. (Previously
+    // the code clamped to 0 here and emitted the LSB byte, which destroyed
+    // the signal entirely.)
     int subslotBytes = configuredSubslotSize;
     int dataShift = (subslotBytes * 8) - 16;
-    if (dataShift < 0) dataShift = 0;
 
     const int CHUNK = 512;
     uint8_t convBuf[CHUNK * 4]; // max 4 bytes per sample
@@ -1351,7 +1354,8 @@ int UsbAudioDriver::writeInt16(const int16_t* data, int numSamples) {
                 else if (fs < -32768.0f) fs = -32768.0f;
                 scaled = (int32_t)fs;
             }
-            int32_t wire = scaled << dataShift;
+            int32_t wire = (dataShift >= 0) ? (scaled << dataShift)
+                                            : (scaled >> -dataShift);
             for (int b = 0; b < subslotBytes; b++) {
                 convBuf[outBytes++] = (wire >> (b * 8)) & 0xFF;
             }
@@ -1406,10 +1410,15 @@ int UsbAudioDriver::writeInt24Packed(const uint8_t* data, int numBytes) {
                 v = (int32_t)fs;
             }
 
-            // The value is 24-bit; left-align inside the DAC subslot.
+            // The value is 24-bit; left-align inside the DAC subslot when the
+            // subslot is wide enough, otherwise drop LSBs so the signal MSBs
+            // reach the DAC (e.g. 24-bit source -> 16-bit DAC). Clamping to 0
+            // here would emit the LSB bytes of v and silently destroy the
+            // signal, producing the "noise that scales with input level"
+            // symptom characteristic of LSB-only playback.
             int dataShift = (subslotBytes * 8) - 24;
-            if (dataShift < 0) dataShift = 0;
-            int32_t wire = v << dataShift;
+            int32_t wire = (dataShift >= 0) ? (v << dataShift)
+                                            : (v >> -dataShift);
             for (int b = 0; b < subslotBytes; b++) {
                 convBuf[outBytes++] = (wire >> (b * 8)) & 0xFF;
             }
@@ -1429,9 +1438,10 @@ int UsbAudioDriver::writeInt32(const int32_t* data, int numSamples) {
 
     int subslotBytes = configuredSubslotSize;
     // 32-bit data is already full-range; no left-align padding needed for 32-bit DAC.
-    // For 24-bit DAC reception of 32-bit source, we lose 8 LSBs by simple truncation.
+    // For narrower DAC subslots (24-bit, 16-bit, etc.) we truncate LSBs so the
+    // signal's MSBs survive in the output. Clamping to 0 here would emit the
+    // LSB bytes of the source and lose the signal entirely.
     int dataShift = (subslotBytes * 8) - 32;
-    if (dataShift < 0) dataShift = 0;
 
     const int CHUNK = 512;
     uint8_t convBuf[CHUNK * 4];
@@ -1455,7 +1465,8 @@ int UsbAudioDriver::writeInt32(const int32_t* data, int numSamples) {
                 else if (fs < -2147483648.0f) fs = -2147483648.0f;
                 v = (int32_t)fs;
             }
-            int32_t wire = v << dataShift;
+            int32_t wire = (dataShift >= 0) ? (v << dataShift)
+                                            : (v >> -dataShift);
             for (int b = 0; b < subslotBytes; b++) {
                 convBuf[outBytes++] = (wire >> (b * 8)) & 0xFF;
             }
