@@ -61,6 +61,7 @@ bool UsbAudioDriver::open(int fd) {
     }
 
     opened = true;
+    capFirstActivationAfterOpen.store(true);
     LOGI("USB device opened via fd %d", fd);
     return true;
 }
@@ -483,8 +484,12 @@ bool UsbAudioDriver::parseDescriptors() {
 }
 
 std::vector<int> UsbAudioDriver::getSupportedRates() {
+    // Historical name; returns output-side rates only. The merged `formats`
+    // vector now also contains capture alt-settings (added later), so we
+    // filter to keep this API's playback semantics intact for legacy callers.
     std::vector<int> rates;
     for (auto& f : formats) {
+        if (f.isCapture) continue;
         if (std::find(rates.begin(), rates.end(), f.sampleRate) == rates.end()) {
             rates.push_back(f.sampleRate);
         }
@@ -552,6 +557,33 @@ bool UsbAudioDriver::setSampleRateUAC2(int clockId, int rate) {
     }
 
     LOGI("UAC2: set sample rate %d Hz on clock source %d", rate, clockId);
+
+    // Read back SAM_FREQ_CONTROL — diagnostic for first-record empty-WAV bug.
+    // Some ADCs silently no-op SET_CUR when the requested rate matches their
+    // current internal state, and an iso IN endpoint configured against an
+    // un-armed ADC delivers COMPLETED-but-empty packets. If the readback rate
+    // here differs from `rate`, the SET_CUR didn't take effect.
+    uint8_t readBuf[4] = {0};
+    int rcRead = libusb_control_transfer(handle,
+        LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_INTERFACE,
+        UAC_GET_CUR,
+        (UAC2_CS_CONTROL_SAM_FREQ << 8),
+        wIndex,
+        readBuf, 4, 1000);
+    if (rcRead >= 4) {
+        uint32_t reportedRate = (uint32_t)readBuf[0]
+                | ((uint32_t)readBuf[1] << 8)
+                | ((uint32_t)readBuf[2] << 16)
+                | ((uint32_t)readBuf[3] << 24);
+        if ((int)reportedRate == rate) {
+            LOGI("UAC2: GET_CUR sample_rate=%u Hz (matches requested)", reportedRate);
+        } else {
+            LOGE("UAC2: GET_CUR sample_rate=%u Hz but requested %d Hz — SET_CUR may have been ignored",
+                 reportedRate, rate);
+        }
+    } else {
+        LOGD("UAC2: GET_CUR sample_rate readback not supported (rc=%d)", rcRead);
+    }
 
     // Verify clock is valid
     uint8_t validBuf[1] = {0};
@@ -1072,8 +1104,11 @@ bool UsbAudioDriver::start() {
     LOGI("detach_kernel_driver(AS iface %d): %s", activeFormat.interfaceNum,
          rc == 0 ? "OK" : libusb_error_name(rc));
 
-    // Claim Audio Control interface to hold off kernel driver
-    if (acInterfaceNum >= 0) {
+    // Claim Audio Control interface to hold off kernel driver. Idempotent
+    // because the AC interface is shared with capture; re-claiming while
+    // libusb has IN transfers queued causes usbfs to issue an implicit
+    // SET_INTERFACE that resets the device's endpoint state.
+    if (acInterfaceNum >= 0 && !acInterfaceClaimed) {
         rc = libusb_claim_interface(handle, acInterfaceNum);
         if (rc < 0) {
             LOGI("claim_interface(AC %d) failed: %s (non-fatal)",
@@ -1618,6 +1653,48 @@ std::vector<int> UsbAudioDriver::getCaptureChannelCounts() const {
     return out;
 }
 
+std::vector<int> UsbAudioDriver::getOutputRates() const {
+    // Match getSupportedRates() semantics: filter only by direction. The
+    // isDsd flag is set on UAC2 alt-settings whose bmFormats has bit 31
+    // (RAW_DATA), which is widely misused by consumer dongles to flag
+    // normal PCM alt-settings too. Filtering by isDsd here would drop
+    // valid PCM output formats. If a DSD-only alt leaks through, configure()
+    // will reject it cleanly.
+    std::vector<int> out;
+    for (auto& f : formats) {
+        if (f.isCapture) continue;
+        if (std::find(out.begin(), out.end(), f.sampleRate) == out.end()) {
+            out.push_back(f.sampleRate);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::vector<int> UsbAudioDriver::getOutputBitDepths() const {
+    std::vector<int> out;
+    for (auto& f : formats) {
+        if (f.isCapture) continue;
+        if (std::find(out.begin(), out.end(), f.bitDepth) == out.end()) {
+            out.push_back(f.bitDepth);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::vector<int> UsbAudioDriver::getOutputChannelCounts() const {
+    std::vector<int> out;
+    for (auto& f : formats) {
+        if (f.isCapture) continue;
+        if (std::find(out.begin(), out.end(), f.channels) == out.end()) {
+            out.push_back(f.channels);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 bool UsbAudioDriver::configureCapture(int sampleRate, int channels, int bitDepth) {
     if (!opened) {
         LOGE("configureCapture() called but not opened");
@@ -1697,35 +1774,83 @@ void UsbAudioDriver::handleCaptureComplete(struct libusb_transfer* transfer) {
         return;
     }
 
-    if (transfer->status != LIBUSB_TRANSFER_COMPLETED &&
-        transfer->status != LIBUSB_TRANSFER_TIMED_OUT) {
-        LOGE("Capture transfer status=%d (%s)", transfer->status,
-             transfer->status == LIBUSB_TRANSFER_ERROR ? "ERROR" :
-             transfer->status == LIBUSB_TRANSFER_STALL ? "STALL" :
-             transfer->status == LIBUSB_TRANSFER_NO_DEVICE ? "NO_DEVICE" :
-             transfer->status == LIBUSB_TRANSFER_OVERFLOW ? "OVERFLOW" :
-             transfer->status == LIBUSB_TRANSFER_CANCELLED ? "CANCELLED" : "UNKNOWN");
+    // CANCELLED / NO_DEVICE are terminal: we either initiated the cancel
+    // (stopCapture) or the device is physically gone. Retire the slot.
+    if (transfer->status == LIBUSB_TRANSFER_CANCELLED ||
+        transfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
         int remaining = --capActiveTransfers;
         if (remaining <= 0) {
-            LOGE("All capture transfers failed -- stopping capture");
             capStreaming.store(false);
         }
         return;
     }
 
-    // Iso IN packets are scattered at uniform stride. We set every packet's
-    // length to capEffectiveMaxPkt at submit, so packet p starts at
-    // buffer + p * capEffectiveMaxPkt; only the first actual_length bytes are
-    // valid PCM. If the ring buffer is full (Java reader is too slow) we drop
-    // the excess silently -- capture is producer-paced and we cannot stall
-    // the USB bus.
+    // STALL needs a clear_halt before any further submits succeed.
+    if (transfer->status == LIBUSB_TRANSFER_STALL && handle) {
+        libusb_clear_halt(handle, transfer->endpoint);
+    }
+
+    // For COMPLETED / TIMED_OUT / ERROR / OVERFLOW / STALL: process whatever
+    // iso packets did succeed individually. Even on an overall ERROR status
+    // some packets may carry valid data, and on warmup the device often
+    // produces partial transfers before settling. Always resubmit so the
+    // pipeline keeps the device exercised — a fresh USB IN endpoint may
+    // need many transfers to start delivering reliably.
+    int packetsOk = 0;
+    int packetsEmptyCompleted = 0;
+    int packetsNotCompleted = 0;
     for (int p = 0; p < transfer->num_iso_packets; p++) {
         auto& pkt = transfer->iso_packet_desc[p];
-        if (pkt.status != LIBUSB_TRANSFER_COMPLETED) continue;
+        if (pkt.status != LIBUSB_TRANSFER_COMPLETED) {
+            packetsNotCompleted++;
+            continue;
+        }
         int len = pkt.actual_length;
-        if (len <= 0) continue;
+        if (len <= 0) {
+            packetsEmptyCompleted++;
+            continue;
+        }
         uint8_t* src = transfer->buffer + (capEffectiveMaxPkt * p);
         if (capRingBuffer) capRingBuffer->write(src, len);
+        packetsOk++;
+    }
+
+    // Diagnostic histogram for the empty-WAV bug. Tallied per transfer and
+    // emitted once every CAP_DIAG_LOG_EVERY transfers so we can see the shape
+    // of the stream — a healthy session is ~all-with-data, a stuck-ADC session
+    // is ~all-empty-COMPLETED.
+    capDiagPacketsWithData += packetsOk;
+    capDiagPacketsCompletedEmpty += packetsEmptyCompleted;
+    capDiagPacketsNonCompleted += packetsNotCompleted;
+    if (++capDiagTransfersSinceLog >= CAP_DIAG_LOG_EVERY) {
+        LOGI("Capture diag over %d transfers: with_data=%d empty_completed=%d not_completed=%d",
+             capDiagTransfersSinceLog, capDiagPacketsWithData,
+             capDiagPacketsCompletedEmpty, capDiagPacketsNonCompleted);
+        capDiagTransfersSinceLog = 0;
+        capDiagPacketsWithData = 0;
+        capDiagPacketsCompletedEmpty = 0;
+        capDiagPacketsNonCompleted = 0;
+    }
+
+    // First successful packet retires the "first activation after open" state
+    // so subsequent startCapture() calls skip the warm-up SET_CUR.
+    if (packetsOk > 0 && capFirstActivationAfterOpen.load()) {
+        capFirstActivationAfterOpen.store(false);
+    }
+
+    // Circuit breaker: if a streak of resubmits produces zero successful
+    // packets we eventually give up. At ~125us per microframe this gives
+    // the device about 5 seconds of warmup leeway before we admit defeat.
+    if (packetsOk > 0) {
+        capConsecutiveErrors.store(0, std::memory_order_relaxed);
+    } else if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+        int n = capConsecutiveErrors.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n >= 5000) {
+            LOGE("Capture: %d consecutive empty/error transfers — giving up", n);
+            int remaining = --capActiveTransfers;
+            if (remaining <= 0) capStreaming.store(false);
+            return;
+        }
     }
 
     int idx = -1;
@@ -1849,6 +1974,34 @@ bool UsbAudioDriver::startCapture() {
         bool sharedClockAlreadySet = streaming.load()
                 && capClockId == activeFormat.clockSourceId;
         if (!sharedClockAlreadySet) {
+            // First-activation warm-up: some UAC2 ADCs silently ignore the
+            // first SET_CUR after enumeration when the requested rate equals
+            // the device's power-on default — the ADC never arms and iso IN
+            // packets come back COMPLETED with actual_length=0. Bracketing
+            // the real SET_CUR with one at a different rate forces the
+            // controller to re-arm. See capFirstActivationAfterOpen in
+            // usb_audio.h. Best-effort: if the warm-up rate is rejected we
+            // still proceed with the real SET_CUR.
+            if (capFirstActivationAfterOpen.load()) {
+                int warmupRate = 0;
+                for (auto& f : formats) {
+                    if (!f.isCapture) continue;
+                    if (f.clockSourceId != capActiveFormat.clockSourceId) continue;
+                    if (f.sampleRate == capRate) continue;
+                    if (warmupRate == 0 || f.sampleRate < warmupRate) {
+                        warmupRate = f.sampleRate;
+                    }
+                }
+                if (warmupRate > 0) {
+                    LOGI("Capture warm-up: SET_CUR %d Hz before real %d Hz (clk %d)",
+                         warmupRate, capRate, capClockId);
+                    setSampleRateUAC2(capClockId, warmupRate);
+                    usleep(10000);
+                } else {
+                    LOGI("Capture warm-up skipped: no alternative rate on clock %d",
+                         capClockId);
+                }
+            }
             if (!setSampleRateUAC2(capClockId, capRate)) {
                 LOGE("startCapture(): ADC rejected sample rate %d Hz", capRate);
                 stopCapture();
@@ -1886,6 +2039,11 @@ bool UsbAudioDriver::startCapture() {
 
     capStreaming.store(true);
     capActiveTransfers.store(CAP_NUM_TRANSFERS);
+    capConsecutiveErrors.store(0);
+    capDiagTransfersSinceLog = 0;
+    capDiagPacketsWithData = 0;
+    capDiagPacketsCompletedEmpty = 0;
+    capDiagPacketsNonCompleted = 0;
 
     for (int i = 0; i < CAP_NUM_TRANSFERS; i++) {
         rc = libusb_submit_transfer(capTransfers[i]);

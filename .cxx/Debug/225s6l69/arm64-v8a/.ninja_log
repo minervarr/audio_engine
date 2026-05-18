@@ -27,3 +27,16 @@
 12	7438	8007089884976556	CMakeFiles/matrix_audio.dir/usb_audio_jni.cpp.o	276add0f2cdc818e
 30	8479	8007089895380150	CMakeFiles/matrix_audio.dir/usb_audio.cpp.o	b5d4b054c51cb05a
 8479	8730	8007089897861633	C:/Users/incxiuefb/Documents/Files/clone/audio_recorder/audioengine/build/intermediates/cxx/Debug/225s6l69/obj/arm64-v8a/libmatrix_audio.so	aa1124960430cff8
+56	10502	8007481325550925	CMakeFiles/matrix_audio.dir/usb_audio_jni.cpp.o	276add0f2cdc818e
+78	12013	8007481340614260	CMakeFiles/matrix_audio.dir/usb_audio.cpp.o	b5d4b054c51cb05a
+12014	12397	8007481344319355	C:/Users/incxiuefb/Documents/Files/clone/audio_recorder/audioengine/build/intermediates/cxx/Debug/225s6l69/obj/arm64-v8a/libmatrix_audio.so	aa1124960430cff8
+11	2591	8007493977846314	CMakeFiles/matrix_audio.dir/usb_audio.cpp.o	b5d4b054c51cb05a
+2591	2730	8007493979287086	C:/Users/incxiuefb/Documents/Files/clone/audio_recorder/audioengine/build/intermediates/cxx/Debug/225s6l69/obj/arm64-v8a/libmatrix_audio.so	aa1124960430cff8
+15	2668	8007506775205928	CMakeFiles/matrix_audio.dir/usb_audio.cpp.o	b5d4b054c51cb05a
+2669	2824	8007506776768708	C:/Users/incxiuefb/Documents/Files/clone/audio_recorder/audioengine/build/intermediates/cxx/Debug/225s6l69/obj/arm64-v8a/libmatrix_audio.so	aa1124960430cff8
+23	1628	8007706591633108	CMakeFiles/matrix_audio.dir/usb_audio_jni.cpp.o	276add0f2cdc818e
+46	2744	8007706602715541	CMakeFiles/matrix_audio.dir/usb_audio.cpp.o	b5d4b054c51cb05a
+2745	2894	8007706604235895	C:/Users/incxiuefb/Documents/Files/clone/audio_recorder/audioengine/build/intermediates/cxx/Debug/225s6l69/obj/arm64-v8a/libmatrix_audio.so	aa1124960430cff8
+7	1325	8007751152966819	CMakeFiles/matrix_audio.dir/usb_audio_jni.cpp.o	276add0f2cdc818e
+15	2596	8007751165634395	CMakeFiles/matrix_audio.dir/usb_audio.cpp.o	b5d4b054c51cb05a
+2597	2751	8007751167240519	C:/Users/incxiuefb/Documents/Files/clone/audio_recorder/audioengine/build/intermediates/cxx/Debug/225s6l69/obj/arm64-v8a/libmatrix_audio.so	aa1124960430cff8

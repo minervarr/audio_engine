@@ -360,4 +360,25 @@ Java_com_nerio_audioengine_UsbAudioNative_nativeGetSupportedCaptureChannelCounts
     return vecToJArray(env, driver->getCaptureChannelCounts());
 }
 
+JNIEXPORT jintArray JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetSupportedOutputRates(JNIEnv* env, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return env->NewIntArray(0);
+    return vecToJArray(env, driver->getOutputRates());
+}
+
+JNIEXPORT jintArray JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetSupportedOutputBitDepths(JNIEnv* env, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return env->NewIntArray(0);
+    return vecToJArray(env, driver->getOutputBitDepths());
+}
+
+JNIEXPORT jintArray JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetSupportedOutputChannelCounts(JNIEnv* env, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return env->NewIntArray(0);
+    return vecToJArray(env, driver->getOutputChannelCounts());
+}
+
 } // extern "C"

@@ -187,6 +187,14 @@ public:
     std::vector<int> getCaptureBitDepths() const;
     std::vector<int> getCaptureChannelCounts() const;
 
+    // Output (DAC) capability introspection. Mirrors the capture-side getters
+    // above. Filters the merged `formats` vector for non-capture, non-DSD
+    // alt-settings so callers can constrain a UI to formats both directions
+    // support (e.g., a recorder enabling live monitor playback).
+    std::vector<int> getOutputRates() const;
+    std::vector<int> getOutputBitDepths() const;
+    std::vector<int> getOutputChannelCounts() const;
+
 private:
     bool setInterfaceAltSetting(int interface_num, int alt_setting);
     bool setSampleRate(int endpoint, int rate);
@@ -277,6 +285,29 @@ private:
     std::atomic<bool> capStreaming{false};
     bool capInterfaceClaimed = false;
     bool capConfigured = false;
+    // Consecutive transfer errors with zero successful packets in between.
+    // Resets every time a packet arrives. Used as a circuit-breaker so a
+    // genuinely dead endpoint can't loop on resubmits forever.
+    std::atomic<int> capConsecutiveErrors{0};
+    // Some UAC2 ADCs (observed on TTGK KM-HIFI-384KHZ) ignore the first
+    // SET_CUR SAM_FREQ_CONTROL after enumeration when the requested rate
+    // matches the device's power-on default — the ADC never arms and iso IN
+    // transfers come back COMPLETED with actual_length=0. Bracketing the real
+    // SET_CUR with a SET_CUR at a different rate forces the controller to
+    // actually re-arm. This flag latches that "first activation per open"
+    // condition. Cleared once the iso pipeline reports a successful packet.
+    // Read from the recorder thread (startCapture), written from both the
+    // recorder thread (open) and the libusb event thread (handleCaptureComplete).
+    std::atomic<bool> capFirstActivationAfterOpen{true};
+    // Per-transfer diagnostic counters for the empty-WAV bug. Tallied in
+    // handleCaptureComplete() and emitted as a one-line LOGI every
+    // CAP_DIAG_LOG_EVERY transfers. All accesses happen on the libusb event
+    // thread; no synchronization needed.
+    static const int CAP_DIAG_LOG_EVERY = 1000;
+    int capDiagTransfersSinceLog = 0;
+    int capDiagPacketsWithData = 0;
+    int capDiagPacketsCompletedEmpty = 0;
+    int capDiagPacketsNonCompleted = 0;
 };
 
 #endif // USB_AUDIO_H

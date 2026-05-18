@@ -47,4 +47,9 @@ public class UsbAudioNative {
     public static native int[] nativeGetSupportedCaptureRates(long handle);
     public static native int[] nativeGetSupportedCaptureBitDepths(long handle);
     public static native int[] nativeGetSupportedCaptureChannelCounts(long handle);
+
+    // Output (DAC) capability introspection. See companion C++ in usb_audio.cpp.
+    public static native int[] nativeGetSupportedOutputRates(long handle);
+    public static native int[] nativeGetSupportedOutputBitDepths(long handle);
+    public static native int[] nativeGetSupportedOutputChannelCounts(long handle);
 }

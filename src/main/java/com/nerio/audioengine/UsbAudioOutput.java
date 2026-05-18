@@ -487,6 +487,27 @@ public class UsbAudioOutput implements AudioOutput {
         return new int[0];
     }
 
+    public int[] getSupportedOutputRates() {
+        if (nativeHandle != 0) {
+            return UsbAudioNative.nativeGetSupportedOutputRates(nativeHandle);
+        }
+        return new int[0];
+    }
+
+    public int[] getSupportedOutputBitDepths() {
+        if (nativeHandle != 0) {
+            return UsbAudioNative.nativeGetSupportedOutputBitDepths(nativeHandle);
+        }
+        return new int[0];
+    }
+
+    public int[] getSupportedOutputChannelCounts() {
+        if (nativeHandle != 0) {
+            return UsbAudioNative.nativeGetSupportedOutputChannelCounts(nativeHandle);
+        }
+        return new int[0];
+    }
+
     private static String encodingName(int encoding) {
         switch (encoding) {
             case AudioFormat.ENCODING_PCM_FLOAT: return "float32";

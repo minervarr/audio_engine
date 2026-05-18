@@ -5,6 +5,7 @@ import android.util.Log;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Capture view of a USB Audio Class device. Records PCM from the device's ADC
@@ -38,6 +39,9 @@ public class UsbAudioInput {
     private RandomAccessFile wavFile;
     private long bytesWritten;
     private volatile UsbAudioOutput monitorOut;
+    private volatile int monitorOutChannels;
+    private byte[] monitorExpandBuf;
+    private final AtomicLong framesWritten = new AtomicLong(0);
 
     UsbAudioInput(long nativeHandle, UsbAudioDevice owner) {
         this.nativeHandle = nativeHandle;
@@ -105,12 +109,25 @@ public class UsbAudioInput {
 
     /**
      * Routes a copy of every captured PCM block written to the WAV into {@code out}
-     * for live monitoring through a {@link UsbAudioOutput} configured at the same
-     * rate / channels / bit-depth. Pass {@code null} to disable. The output must
-     * already be configured and started; this class does not own its lifecycle.
+     * for live monitoring through a {@link UsbAudioOutput}. The output must already
+     * be configured and started; this class does not own its lifecycle.
+     *
+     * <p>When the monitor output's channel count exceeds the input's, the record
+     * loop performs an N→M upmix: each frame is written with the original input
+     * channels followed by copies of channel 0 in the trailing slots. For the
+     * common case of mono mic → stereo headphones, each mono sample lands in both
+     * L and R of the output stream.
+     *
+     * <p>Pass {@code null} for {@code out} to disable monitoring.
      */
-    public void setMonitorOutput(UsbAudioOutput out) {
+    public void setMonitorOutput(UsbAudioOutput out, int outChannels) {
+        this.monitorOutChannels = Math.max(channels, outChannels);
         this.monitorOut = out;
+    }
+
+    /** Back-compat alias: assumes the monitor output uses the same channel count as input. */
+    public void setMonitorOutput(UsbAudioOutput out) {
+        setMonitorOutput(out, channels);
     }
 
     public void stop() {
@@ -146,6 +163,7 @@ public class UsbAudioInput {
         wavFile.setLength(0);
         writeWavHeader(wavFile, rate, channels, bitDepth);
         bytesWritten = 0;
+        framesWritten.set(0);
 
         recording = true;
         recordThread = new Thread(this::recordLoop, "UsbAudioInput-WAV");
@@ -218,10 +236,26 @@ public class UsbAudioInput {
                 }
                 wavFile.write(outBuf, 0, outLen);
                 bytesWritten += outLen;
+                int frameBytes = outBytesPerSample * channels;
+                if (frameBytes > 0) {
+                    framesWritten.addAndGet(outLen / frameBytes);
+                }
                 UsbAudioOutput mo = monitorOut;
                 if (mo != null) {
+                    final int outCh = monitorOutChannels;
+                    byte[] monitorBuf = outBuf;
+                    int monitorLen = outLen;
+                    if (outCh > channels && channels > 0) {
+                        int needed = outLen * outCh / channels;
+                        if (monitorExpandBuf == null || monitorExpandBuf.length < needed) {
+                            monitorExpandBuf = new byte[needed];
+                        }
+                        monitorLen = expandChannels(outBuf, outLen, monitorExpandBuf,
+                                outBytesPerSample, channels, outCh);
+                        monitorBuf = monitorExpandBuf;
+                    }
                     try {
-                        mo.write(outBuf, 0, outLen);
+                        mo.write(monitorBuf, 0, monitorLen);
                     } catch (Throwable t) {
                         Log.w(TAG, "monitor write failed; dropping monitor", t);
                         monitorOut = null;
@@ -232,6 +266,32 @@ public class UsbAudioInput {
                 break;
             }
         }
+    }
+
+    /**
+     * Expand each PCM frame from {@code srcCh} channels to {@code dstCh}
+     * channels (dstCh ≥ srcCh). Writes the srcCh source samples as-is,
+     * then fills each of the (dstCh − srcCh) remaining output channels with
+     * a copy of channel 0. For the common mono→stereo case (srcCh=1,
+     * dstCh=2), each mono sample is written twice consecutively so it
+     * appears on both L and R.
+     */
+    private static int expandChannels(byte[] in, int inLen, byte[] out,
+                                      int bytesPerSample, int srcCh, int dstCh) {
+        int srcFrameBytes = srcCh * bytesPerSample;
+        int o = 0;
+        for (int i = 0; i + srcFrameBytes <= inLen; i += srcFrameBytes) {
+            for (int b = 0; b < srcFrameBytes; b++) {
+                out[o++] = in[i + b];
+            }
+            int extras = dstCh - srcCh;
+            for (int e = 0; e < extras; e++) {
+                for (int b = 0; b < bytesPerSample; b++) {
+                    out[o++] = in[i + b];
+                }
+            }
+        }
+        return o;
     }
 
     /**
@@ -303,4 +363,5 @@ public class UsbAudioInput {
     public int getConfiguredSubslotSize() { return subslot; }
     public boolean isStarted() { return started; }
     public boolean isRecording() { return recording; }
+    public long getFramesWritten() { return framesWritten.get(); }
 }
