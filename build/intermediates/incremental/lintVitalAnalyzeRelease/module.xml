@@ -1,9 +1,9 @@
 <lint-module
     format="1"
-    dir="C:\Users\incxiuefb\Documents\Files\clone\media_player\audioengine"
+    dir="C:\Users\incxiuefb\Documents\Files\clone\audio_recorder\audioengine"
     name=":audioengine"
     type="LIBRARY"
-    maven="matrix_player:audioengine:unspecified"
+    maven="audio_recorder:audioengine:unspecified"
     agpVersion="9.0.1"
     buildFolder="build"
     bootClassPath="C:\PPProgam\android_sdk\platforms\android-36.1\android.jar;C:\PPProgam\android_sdk\build-tools\36.0.0\core-lambda-stubs.jar"

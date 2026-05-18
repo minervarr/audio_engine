@@ -1,5 +1,5 @@
 @echo off
 "C:\\PPProgam\\android_sdk\\cmake\\3.22.1\\bin\\ninja.exe" ^
   -C ^
-  "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\media_player\\audioengine\\.cxx\\RelWithDebInfo\\52194mo6\\armeabi-v7a" ^
+  "C:\\Users\\incxiuefb\\Documents\\Files\\clone\\audio_recorder\\audioengine\\.cxx\\RelWithDebInfo\\52194mo6\\armeabi-v7a" ^
   matrix_audio

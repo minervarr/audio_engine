@@ -159,6 +159,20 @@ bool UsbAudioDriver::parseDescriptors() {
                         }
                         LOGD("UAC2 Input Terminal %d (type 0x%04x) -> Clock %d", termId, termType, csId);
                     }
+                    // UAC1 Input Terminal: layout [3]=bTerminalID [4..5]=wTerminalType
+                    // [6]=bAssocTerminal [7]=bNrChannels. No clock-source link
+                    // (UAC1 sample rate lives on the AS endpoint), so skip
+                    // terminalToClock here.
+                    if (uacVersion < 2 && subType == UAC_INPUT_TERMINAL && descLen >= 6) {
+                        int termId = extra[pos + 3];
+                        int termType = extra[pos + 4] | (extra[pos + 5] << 8);
+                        if (termType == 0x0101) {
+                            isUsbStreamingIT[termId] = true;
+                        } else if ((termType & 0xFF00) != 0x0100) {
+                            isCaptureSourceIT[termId] = true;
+                        }
+                        LOGD("UAC1 Input Terminal %d (type 0x%04x)", termId, termType);
+                    }
                     // UAC2 Output Terminal (data flowing OUT of audio function): bCSourceID at offset 8
                     if (uacVersion == 2 && subType == UAC_OUTPUT_TERMINAL && descLen >= 9) {
                         int termId = extra[pos + 3];
@@ -173,6 +187,18 @@ bool UsbAudioDriver::parseDescriptors() {
                         }
                         LOGD("UAC2 Output Terminal %d (type 0x%04x) -> Clock %d",
                              termId, termType, csId);
+                    }
+                    // UAC1 Output Terminal: layout [3]=bTerminalID [4..5]=wTerminalType
+                    // [6]=bAssocTerminal [7]=bSourceID [8]=iTerminal. Capture AS
+                    // interfaces set bTerminalLink to one of these (the host-side
+                    // streaming sink, terminal type 0x0101).
+                    if (uacVersion < 2 && subType == UAC_OUTPUT_TERMINAL && descLen >= 6) {
+                        int termId = extra[pos + 3];
+                        int termType = extra[pos + 4] | (extra[pos + 5] << 8);
+                        if ((termType & 0xFF00) == 0x0100) {
+                            isUsbStreamingOT[termId] = true;
+                        }
+                        LOGD("UAC1 Output Terminal %d (type 0x%04x)", termId, termType);
                     }
                     // UAC2 Feature Unit: layout [3]=bUnitID [4]=bSourceID
                     // [5..]=bmaControls[N+1] (4 bytes per channel, master first).
@@ -326,6 +352,12 @@ bool UsbAudioDriver::parseDescriptors() {
                             bitDepth = extra[pos + 5];
                         }
                     } else {
+                        // UAC1 AS_GENERAL: layout [3]=bTerminalLink [4]=bDelay
+                        // [5..6]=wFormatTag. Capture-direction classification
+                        // below uses bTerminalLink to look up the linked OT/IT.
+                        if (subType == UAC_AS_GENERAL && descLen >= 4) {
+                            bTerminalLink = extra[pos + 3];
+                        }
                         // UAC1 FORMAT_TYPE descriptor
                         // Layout: [3]=bFormatType [4]=bNrChannels [5]=bSubFrameSize
                         //         [6]=bBitResolution [7]=bSamFreqType ...
@@ -377,7 +409,7 @@ bool UsbAudioDriver::parseDescriptors() {
             // it straight at the physical capture IT (Mic 0x02xx etc.) -- accept
             // that too for robustness.
             bool isCaptureAs = false;
-            if (uacVersion >= 2 && bTerminalLink > 0
+            if (bTerminalLink > 0
                     && (isUsbStreamingOT.count(bTerminalLink)
                             || isCaptureSourceIT.count(bTerminalLink))) {
                 isCaptureAs = true;
@@ -1974,33 +2006,34 @@ bool UsbAudioDriver::startCapture() {
         bool sharedClockAlreadySet = streaming.load()
                 && capClockId == activeFormat.clockSourceId;
         if (!sharedClockAlreadySet) {
-            // First-activation warm-up: some UAC2 ADCs silently ignore the
-            // first SET_CUR after enumeration when the requested rate equals
-            // the device's power-on default — the ADC never arms and iso IN
-            // packets come back COMPLETED with actual_length=0. Bracketing
-            // the real SET_CUR with one at a different rate forces the
-            // controller to re-arm. See capFirstActivationAfterOpen in
-            // usb_audio.h. Best-effort: if the warm-up rate is rejected we
-            // still proceed with the real SET_CUR.
-            if (capFirstActivationAfterOpen.load()) {
-                int warmupRate = 0;
-                for (auto& f : formats) {
-                    if (!f.isCapture) continue;
-                    if (f.clockSourceId != capActiveFormat.clockSourceId) continue;
-                    if (f.sampleRate == capRate) continue;
-                    if (warmupRate == 0 || f.sampleRate < warmupRate) {
-                        warmupRate = f.sampleRate;
-                    }
+            // Warm-up: some UAC2 ADCs silently ignore a SET_CUR when the
+            // requested rate equals the rate they last latched (or their
+            // power-on default on the very first activation) — the ADC never
+            // arms and iso IN packets come back COMPLETED with
+            // actual_length=0. Bracketing the real SET_CUR with one at a
+            // different rate forces the controller to re-arm. We run this on
+            // every startCapture(): stuck-ADC has been observed not only on
+            // first activation but also on subsequent record sessions within
+            // the same plug-in, so the gate was removed. Best-effort: if the
+            // warm-up rate is rejected we still proceed with the real
+            // SET_CUR.
+            int warmupRate = 0;
+            for (auto& f : formats) {
+                if (!f.isCapture) continue;
+                if (f.clockSourceId != capActiveFormat.clockSourceId) continue;
+                if (f.sampleRate == capRate) continue;
+                if (warmupRate == 0 || f.sampleRate < warmupRate) {
+                    warmupRate = f.sampleRate;
                 }
-                if (warmupRate > 0) {
-                    LOGI("Capture warm-up: SET_CUR %d Hz before real %d Hz (clk %d)",
-                         warmupRate, capRate, capClockId);
-                    setSampleRateUAC2(capClockId, warmupRate);
-                    usleep(10000);
-                } else {
-                    LOGI("Capture warm-up skipped: no alternative rate on clock %d",
-                         capClockId);
-                }
+            }
+            if (warmupRate > 0) {
+                LOGI("Capture warm-up: SET_CUR %d Hz before real %d Hz (clk %d)",
+                     warmupRate, capRate, capClockId);
+                setSampleRateUAC2(capClockId, warmupRate);
+                usleep(10000);
+            } else {
+                LOGI("Capture warm-up skipped: no alternative rate on clock %d",
+                     capClockId);
             }
             if (!setSampleRateUAC2(capClockId, capRate)) {
                 LOGE("startCapture(): ADC rejected sample rate %d Hz", capRate);

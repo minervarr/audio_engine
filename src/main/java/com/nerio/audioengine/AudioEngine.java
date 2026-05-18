@@ -1767,9 +1767,14 @@ public class AudioEngine {
     }
 
     private static boolean isLosslessMime(String mime) {
+        // Excludes "audio/raw" (WAV): Android's raw decoder reports PCM_FLOAT
+        // output when asked but emits samples in the int24 numeric range, not
+        // [-1, 1]. UsbAudioDriver::writeFloat32 then clamps every non-zero
+        // gain's output to ±1.0, breaking volume control. Letting WAV use its
+        // native int encoding routes it through writeInt24Packed / writeInt16,
+        // which scale gain correctly.
         return "audio/flac".equals(mime)
-            || "audio/alac".equals(mime)
-            || "audio/raw".equals(mime);
+            || "audio/alac".equals(mime);
     }
 
     private static int bytesPerSampleForEncoding(int encoding) {

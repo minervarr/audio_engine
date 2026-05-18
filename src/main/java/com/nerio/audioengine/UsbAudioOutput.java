@@ -15,6 +15,9 @@ public class UsbAudioOutput implements AudioOutput {
 
     private int inputEncoding;
     private int dacBitDepth;
+    private int sourceChannelCount;   // channels caller feeds via write()
+    private int wireChannelCount;     // channels negotiated on the USB wire
+    private byte[] expandBuf;         // reused upmix scratch (output thread only)
     private boolean dsdMode;
     private DsdMode dsdActiveMode = DsdMode.AUTO;
     private VolumeMode volumeMode = VolumeMode.AUTO;
@@ -102,6 +105,14 @@ public class UsbAudioOutput implements AudioOutput {
             dacBitDepth = 16;
         }
 
+        // Channel-count negotiation: the device may not have a mono alt setting,
+        // so a ch=1 request may relax-match to a stereo alt. Remember both so
+        // write() can upmix mono→stereo on the fly (mirrors UsbAudioInput's
+        // capture-side expandChannels path).
+        sourceChannelCount = channelCount;
+        int negotiatedCh = UsbAudioNative.nativeGetConfiguredChannels(nativeHandle);
+        wireChannelCount = negotiatedCh > 0 ? negotiatedCh : channelCount;
+
         // Re-assert the current volume on the native side after a reconfigure.
         // configure() is called for every new track, so we MUST NOT reset to
         // silence here -- the reset belongs at the DAC-connect layer (MusicService).
@@ -117,10 +128,15 @@ public class UsbAudioOutput implements AudioOutput {
             }
             Log.i(TAG, "Configured DSD: rate=" + sampleRate + "(" + dsdLabel + ") dac=" + dacBitDepth + "bit");
         } else {
+            String chMsg = (wireChannelCount > sourceChannelCount)
+                    ? " srcCh=" + sourceChannelCount + " wireCh=" + wireChannelCount
+                            + " (upmix " + sourceChannelCount + "→" + wireChannelCount + ")"
+                    : " srcCh=" + sourceChannelCount + " wireCh=" + wireChannelCount;
             Log.i(TAG, "Configured: inputEncoding=" + encodingName(inputEncoding)
                     + " source=" + sourceBitDepth + "bit"
                     + " requested=" + requestedBitDepth + "bit"
-                    + " dac=" + dacBitDepth + "bit");
+                    + " dac=" + dacBitDepth + "bit"
+                    + chMsg);
         }
         return true;
     }
@@ -146,6 +162,40 @@ public class UsbAudioOutput implements AudioOutput {
             return UsbAudioNative.nativeWrite(nativeHandle, data, offset, length);
         }
 
+        // Asymmetric-channel upmix: when the wire has more channels than the
+        // caller is feeding (e.g. mono 24-bit recording → stereo-only USB DAC),
+        // duplicate channel 0 into the extra wire channels before the native
+        // write. Otherwise the native path treats consecutive mono samples as
+        // L,R pairs, producing high-pitched aliasing.
+        int sampleBytes = bytesPerInputSample();
+        if (sourceChannelCount > 0
+                && wireChannelCount > sourceChannelCount
+                && sampleBytes > 0) {
+            int srcFrameBytes = sourceChannelCount * sampleBytes;
+            int frames = length / srcFrameBytes;
+            if (frames > 0) {
+                int wireFrameBytes = wireChannelCount * sampleBytes;
+                int outBytes = frames * wireFrameBytes;
+                if (expandBuf == null || expandBuf.length < outBytes) {
+                    expandBuf = new byte[outBytes];
+                }
+                int expanded = expandChannels(data, offset, frames * srcFrameBytes,
+                        expandBuf, sampleBytes, sourceChannelCount, wireChannelCount);
+                int wireWritten = writeByEncoding(expandBuf, 0, expanded);
+                if (wireWritten <= 0) return wireWritten;
+                // Report bytes consumed in the source-channel domain so the
+                // caller's offset bookkeeping stays correct on partial writes.
+                int framesWritten = wireWritten / wireFrameBytes;
+                return framesWritten * srcFrameBytes;
+            }
+            // length < one source frame: nothing to do.
+            return 0;
+        }
+
+        return writeByEncoding(data, offset, length);
+    }
+
+    private int writeByEncoding(byte[] data, int offset, int length) {
         switch (inputEncoding) {
             case AudioFormat.ENCODING_PCM_FLOAT:
                 return UsbAudioNative.nativeWriteFloat32(nativeHandle, data, offset, length);
@@ -159,6 +209,41 @@ public class UsbAudioOutput implements AudioOutput {
                 // Unknown encoding -- fall back to raw passthrough.
                 return UsbAudioNative.nativeWrite(nativeHandle, data, offset, length);
         }
+    }
+
+    private int bytesPerInputSample() {
+        switch (inputEncoding) {
+            case AudioFormat.ENCODING_PCM_FLOAT: return 4;
+            case AudioFormat.ENCODING_PCM_16BIT: return 2;
+            case AudioFormat.ENCODING_PCM_24BIT_PACKED: return 3;
+            case AudioFormat.ENCODING_PCM_32BIT: return 4;
+            default: return 0;
+        }
+    }
+
+    /**
+     * Expand each PCM frame from {@code srcCh} channels to {@code dstCh}
+     * channels (dstCh ≥ srcCh) by copying channel 0 into every extra output
+     * channel. Mono→stereo: each mono sample is written twice. Mirrors the
+     * capture-side helper in {@link UsbAudioInput}.
+     */
+    private static int expandChannels(byte[] in, int inOffset, int inLen, byte[] out,
+                                      int bytesPerSample, int srcCh, int dstCh) {
+        int srcFrameBytes = srcCh * bytesPerSample;
+        int o = 0;
+        int end = inOffset + inLen;
+        for (int i = inOffset; i + srcFrameBytes <= end; i += srcFrameBytes) {
+            for (int b = 0; b < srcFrameBytes; b++) {
+                out[o++] = in[i + b];
+            }
+            int extras = dstCh - srcCh;
+            for (int e = 0; e < extras; e++) {
+                for (int b = 0; b < bytesPerSample; b++) {
+                    out[o++] = in[i + b];
+                }
+            }
+        }
+        return o;
     }
 
     public int getConfiguredBitDepth() {
