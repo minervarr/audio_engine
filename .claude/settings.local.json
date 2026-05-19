@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(git -C \"C:\\\\Users\\\\incxiuefb\\\\Documents\\\\Files\\\\clone\\\\audio_engine\" ls-files)"
-    ]
-  }
-}
