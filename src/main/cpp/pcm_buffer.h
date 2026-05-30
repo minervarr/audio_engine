@@ -17,13 +17,14 @@ public:
 
     ~NativePcmBuffer() { delete[] buffer; }
 
-    // Blocks until all data is written or flushed. Returns true on success, false on flush.
     bool write(const uint8_t* data, int offset, int length) {
         int written = 0;
         while (written < length) {
             std::unique_lock<std::mutex> lock(mtx);
+            size_t want = length - written;
+            if (want > capacity) want = capacity;
             writerCv.wait_for(lock, std::chrono::milliseconds(100), [&] {
-                return available < capacity || flushed.load(std::memory_order_relaxed);
+                return (capacity - available) >= want || flushed.load(std::memory_order_relaxed);
             });
             if (flushed.load(std::memory_order_relaxed)) {
                 flushed.store(false, std::memory_order_relaxed);
@@ -43,7 +44,10 @@ public:
             available += toWrite;
             written += toWrite;
 
-            readerCv.notify_one();
+            // Only notify reader if we've written a decent amount or finished the chunk
+            if (available >= 4096 || written == length) {
+                readerCv.notify_one();
+            }
         }
         return true;
     }
@@ -77,7 +81,10 @@ public:
         readPos = (readPos + toRead) % capacity;
         available -= toRead;
 
-        writerCv.notify_one();
+        // Only notify writer if there is a decent amount of space freed
+        if (capacity - available >= 4096) {
+            writerCv.notify_one();
+        }
         return (int)toRead;
     }
 

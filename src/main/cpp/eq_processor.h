@@ -275,6 +275,17 @@ private:
         }
     }
 
+    // Symmetric quantize of a double in [-1,1] to the full int32 grid with
+    // rounding (not truncation). Used by the bit-transparent Reference EQ path:
+    // the EQ math runs in double, this is the single, final snap to the wire.
+    static inline int32_t quantize32(double s) {
+        if (s > 1.0) s = 1.0; else if (s < -1.0) s = -1.0;
+        long long q = llround(s * 2147483647.0);
+        if (q > 2147483647LL) q = 2147483647LL;
+        else if (q < -2147483648LL) q = -2147483648LL;
+        return static_cast<int32_t>(q);
+    }
+
     void process32(int32_t* samples, int count) {
 #if EQ_HAS_NEON
         if (channelCount == 2) {
@@ -284,15 +295,11 @@ private:
 #else
         if (channelCount == 2) {
             for (int i = 0; i < count; i += 2) {
-                double s0 = samples[i] / 2147483648.0;
-                s0 = processSample(s0, 0);
-                if (s0 > 1.0) s0 = 1.0; else if (s0 < -1.0) s0 = -1.0;
-                samples[i] = static_cast<int32_t>(s0 * 2147483647.0);
+                double s0 = samples[i]     * (1.0 / 2147483647.0);
+                samples[i]     = quantize32(processSample(s0, 0));
 
-                double s1 = samples[i + 1] / 2147483648.0;
-                s1 = processSample(s1, 1);
-                if (s1 > 1.0) s1 = 1.0; else if (s1 < -1.0) s1 = -1.0;
-                samples[i + 1] = static_cast<int32_t>(s1 * 2147483647.0);
+                double s1 = samples[i + 1] * (1.0 / 2147483647.0);
+                samples[i + 1] = quantize32(processSample(s1, 1));
             }
             return;
         }
@@ -301,10 +308,8 @@ private:
         for (int f = 0; f < frames; f++) {
             int base = f * channelCount;
             for (int ch = 0; ch < channelCount; ch++) {
-                double s = samples[base + ch] / 2147483648.0;
-                s = processSample(s, ch);
-                if (s > 1.0) s = 1.0; else if (s < -1.0) s = -1.0;
-                samples[base + ch] = static_cast<int32_t>(s * 2147483647.0);
+                double s = samples[base + ch] * (1.0 / 2147483647.0);
+                samples[base + ch] = quantize32(processSample(s, ch));
             }
         }
     }

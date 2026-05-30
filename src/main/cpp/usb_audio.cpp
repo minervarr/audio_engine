@@ -1,18 +1,31 @@
 #include "usb_audio.h"
-#include "libusb/libusb/libusb.h"
+
+#ifdef _WIN32
+#define NOMINMAX
+#define _CRT_SECURE_NO_WARNINGS
+#include <windows.h>
+#include <avrt.h>
+#pragma comment(lib, "avrt.lib")
+#include <cstdio>
+#define LOGI(...) do { printf("[INFO] " __VA_ARGS__); printf("\n"); fflush(stdout); } while(0)
+#define LOGE(...) do { fprintf(stderr, "[ERR] " __VA_ARGS__); fprintf(stderr, "\n"); fflush(stderr); } while(0)
+#define LOGD(...) do {} while(0)
+static inline int mlock(const void* addr, size_t len) {
+    return VirtualLock((LPVOID)addr, len) ? 0 : -1;
+}
+static inline int munlock(const void* addr, size_t len) {
+    return VirtualUnlock((LPVOID)addr, len) ? 0 : -1;
+}
+static inline int setpriority(int, int, int) { return -1; }
+static inline void usleep(unsigned us) { Sleep(us < 1000 ? 1 : us / 1000); }
+#define PRIO_PROCESS 0
+#else
 #include <android/log.h>
-#include <cstring>
-#include <cmath>
-#include <algorithm>
-#include <unordered_map>
-#include <thread>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
-#include <cerrno>
 #include <sched.h>
 #include <pthread.h>
-
 #define LOG_TAG "UsbAudio"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -20,6 +33,54 @@
 // by default. Bump the logcat tag filter to `UsbAudio:D` when debugging
 // descriptor parsing or format selection.
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#endif
+
+#include "libusb/libusb/libusb.h"
+#include <cstring>
+#include <cmath>
+#include <algorithm>
+#include <unordered_map>
+#include <thread>
+#include <cerrno>
+
+// Diagnostic: when true, the engine does not submit the feedback IN transfer
+// and ignores the feedback callback's stored values. submitTransfer() then
+// always uses nominalFpp (the host's idea of the rate), so packet sizes are
+// the fixed fractional pattern (e.g. 5/6 alternating for 44.1k high-speed).
+// A2+A3 confirmed feedback is NOT the cause of the Windows popcorn; restored
+// to false so feedback is active.
+static const bool DISABLE_FEEDBACK = false;
+
+// Diagnostic A4: when true, submitTransfer() replaces the per-packet ring
+// read with all-zeros. A4 confirmed the data path is the popcorn source
+// (silence is clean), so this is restored to false; left in place so the
+// test can be re-run quickly if needed.
+static const bool SEND_SILENCE = false;
+
+// Diagnostic A8: when true, UsbAudioDriver::writeFloat32() overrides every
+// incoming float sample with a constant DC value (0.3) before the clamp/
+// scale/shift/byte-pack steps. Everything downstream of the per-sample
+// value runs identically to the music path.
+//
+// Purpose: split the data-path bug location between conversion vs upstream.
+//   DC output is clean → conversion correct; bug is in player_window.cpp
+//                       PCM callback (gain, EQ-bypass wiring, resampling).
+//   DC output has clicks → bug is inside writeFloat32 itself (signed shift
+//                         UB, ring wraparound, byte packing).
+static const bool WRITE_CONST_DATA = false;
+
+// Diagnostic A9: when true, submitTransfer() bypasses the ring read entirely
+// and synthesizes a 220 Hz sine directly into each packet using a persistent
+// phase counter that never resets across packets/transfers. This removes the
+// ring buffer, writeFloat32, and the decoder/producer thread from the data
+// path while keeping iso scheduling, packet sizing, feedback and MMCSS
+// identical.
+//
+//   Clean continuous tone → iso delivery is faithful; bug is in the ring /
+//                           producer-consumer path.
+//   Tone with clicks/warble → iso packet delivery itself drops/repeats/
+//                             mis-times packets (structural WinUSB).
+static const bool GEN_SINE_IN_SUBMIT = false;
 
 UsbAudioDriver::UsbAudioDriver() = default;
 
@@ -64,6 +125,112 @@ bool UsbAudioDriver::open(int fd) {
     capFirstActivationAfterOpen.store(true);
     LOGI("USB device opened via fd %d", fd);
     return true;
+}
+
+#ifdef _WIN32
+bool UsbAudioDriver::open(uint16_t vid, uint16_t pid) {
+    if (opened) close();
+
+    LOGI("Opening USB device VID=%04X PID=%04X", vid, pid);
+
+    int rc = libusb_init(&ctx);
+    if (rc < 0) {
+        LOGE("libusb_init failed: %s", libusb_error_name(rc));
+        return false;
+    }
+
+    handle = libusb_open_device_with_vid_pid(ctx, vid, pid);
+    if (!handle) {
+        LOGE("Device VID=%04X PID=%04X not found (check libusbK binding via Zadig)", vid, pid);
+        libusb_exit(ctx);
+        ctx = nullptr;
+        return false;
+    }
+
+    usbSpeed = libusb_get_device_speed(libusb_get_device(handle));
+    LOGI("USB device speed: %s",
+        usbSpeed == LIBUSB_SPEED_LOW ? "Low" :
+        usbSpeed == LIBUSB_SPEED_FULL ? "Full" :
+        usbSpeed == LIBUSB_SPEED_HIGH ? "High" :
+        usbSpeed == LIBUSB_SPEED_SUPER ? "Super" : "Unknown");
+
+    opened = true;
+    capFirstActivationAfterOpen.store(true);
+    LOGI("USB device opened: VID=%04X PID=%04X", vid, pid);
+    return true;
+}
+#endif
+
+std::vector<UsbAudioDeviceInfo> UsbAudioDriver::enumerateUsbAudioDevices() {
+    std::vector<UsbAudioDeviceInfo> result;
+
+    libusb_context* enumCtx = nullptr;
+    if (libusb_init(&enumCtx) < 0) return result;
+
+    libusb_device** devList = nullptr;
+    ssize_t cnt = libusb_get_device_list(enumCtx, &devList);
+    if (cnt < 0) {
+        libusb_exit(enumCtx);
+        return result;
+    }
+
+    for (ssize_t i = 0; i < cnt; i++) {
+        libusb_device* dev = devList[i];
+        struct libusb_device_descriptor desc;
+        if (libusb_get_device_descriptor(dev, &desc) < 0) continue;
+
+        struct libusb_config_descriptor* config = nullptr;
+        if (libusb_get_active_config_descriptor(dev, &config) < 0) {
+            if (libusb_get_config_descriptor(dev, 0, &config) < 0) continue;
+        }
+
+        bool hasAudioOut = false;
+        for (int iface = 0; iface < config->bNumInterfaces && !hasAudioOut; iface++) {
+            const struct libusb_interface& intf = config->interface[iface];
+            for (int alt = 0; alt < intf.num_altsetting && !hasAudioOut; alt++) {
+                const struct libusb_interface_descriptor& d = intf.altsetting[alt];
+                if (d.bInterfaceClass == 1 && d.bInterfaceSubClass == 2) {
+                    for (int ep = 0; ep < d.bNumEndpoints; ep++) {
+                        if ((d.endpoint[ep].bEndpointAddress & 0x80) == 0 &&
+                            (d.endpoint[ep].bmAttributes & 0x03) == 0x01) {
+                            hasAudioOut = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        libusb_free_config_descriptor(config);
+
+        if (!hasAudioOut) continue;
+
+        UsbAudioDeviceInfo info;
+        info.vid = desc.idVendor;
+        info.pid = desc.idProduct;
+
+        char nameBuf[256] = {};
+        libusb_device_handle* h = nullptr;
+        if (libusb_open(dev, &h) == 0) {
+            if (desc.iProduct > 0)
+                libusb_get_string_descriptor_ascii(h, desc.iProduct,
+                    (unsigned char*)nameBuf, sizeof(nameBuf));
+            libusb_close(h);
+        }
+
+        if (nameBuf[0]) {
+            info.name = nameBuf;
+        } else {
+            char fallback[32];
+            snprintf(fallback, sizeof(fallback), "USB Audio %04X:%04X", info.vid, info.pid);
+            info.name = fallback;
+        }
+
+        result.push_back(std::move(info));
+    }
+
+    libusb_free_device_list(devList, 1);
+    libusb_exit(enumCtx);
+    return result;
 }
 
 bool UsbAudioDriver::parseDescriptors() {
@@ -903,6 +1070,23 @@ bool UsbAudioDriver::configure(int sampleRate, int channels, int bitDepth, bool 
          configuredRate, configuredChannels, configuredBitDepth, configuredSubslotSize,
          activeFormat.interfaceNum, activeFormat.altSetting,
          activeFormat.endpointAddr, uacVersion);
+
+    // Arm a ~30 ms startup fade-in (in channel-samples) so the first audio
+    // ramps from silence instead of popping. Re-armed on every configure()
+    // (i.e. every cold start); seamless gapless track swaps don't reconfigure,
+    // so they won't re-trigger a fade mid-stream.
+    fadeSampleTarget_ = (int64_t)(configuredRate * 30 / 1000) * configuredChannels;
+    fadeSampleCounter_ = 0;
+
+    // Allocate ring buffer now so callers can pre-fill before start().
+    int bytesPerFrame = configuredSubslotSize * configuredChannels;
+    int ringSize = configuredRate * bytesPerFrame * 3; // 3 seconds
+    if (ringSize < 131072) ringSize = 131072;
+    delete ringBuffer;
+    ringBuffer = new RingBuffer(ringSize);
+    LOGI("Ring buffer allocated in configure(): %d bytes (%.0f ms)",
+         ringSize, ringSize * 1000.0 / (configuredRate * bytesPerFrame));
+
     return true;
 }
 
@@ -914,6 +1098,23 @@ void UsbAudioDriver::transferCallback(struct libusb_transfer* transfer) {
 }
 
 void UsbAudioDriver::handleTransferComplete(struct libusb_transfer* transfer) {
+    LOGD("transferCb: status=%d streaming=%d active=%d",
+         transfer->status, streaming.load() ? 1 : 0, activeTransfers.load());
+
+    // This transfer just left the in-flight pool. Track the running minimum so
+    // the log reveals whether the queue ever drains toward empty.
+    {
+        int now_inflight = transfersInFlight.fetch_sub(1, std::memory_order_relaxed) - 1;
+        if (now_inflight < minInFlight) minInFlight = now_inflight;
+        uint32_t t = GetTickCount();
+        if ((t - lastInFlightLogMs) >= 1000) {
+            LOGI("iso queue: min in-flight over last interval = %d / %d",
+                 minInFlight, NUM_TRANSFERS);
+            minInFlight = transfersInFlight.load(std::memory_order_relaxed);
+            lastInFlightLogMs = t;
+        }
+    }
+
     if (!streaming.load()) {
         activeTransfers--;
         return;
@@ -921,12 +1122,19 @@ void UsbAudioDriver::handleTransferComplete(struct libusb_transfer* transfer) {
 
     if (transfer->status != LIBUSB_TRANSFER_COMPLETED &&
         transfer->status != LIBUSB_TRANSFER_TIMED_OUT) {
-        LOGE("Transfer status=%d (%s)", transfer->status,
-             transfer->status == LIBUSB_TRANSFER_ERROR ? "ERROR" :
-             transfer->status == LIBUSB_TRANSFER_STALL ? "STALL" :
-             transfer->status == LIBUSB_TRANSFER_NO_DEVICE ? "NO_DEVICE" :
-             transfer->status == LIBUSB_TRANSFER_OVERFLOW ? "OVERFLOW" :
-             transfer->status == LIBUSB_TRANSFER_CANCELLED ? "CANCELLED" : "UNKNOWN");
+        uint32_t now = GetTickCount();
+        if ((now - lastTransferErrLogMs) >= 1000) {
+            LOGE("Transfer status=%d (%s) active=%d ring=%zu",
+                 transfer->status,
+                 transfer->status == LIBUSB_TRANSFER_ERROR ? "ERROR" :
+                 transfer->status == LIBUSB_TRANSFER_STALL ? "STALL" :
+                 transfer->status == LIBUSB_TRANSFER_NO_DEVICE ? "NO_DEVICE" :
+                 transfer->status == LIBUSB_TRANSFER_OVERFLOW ? "OVERFLOW" :
+                 transfer->status == LIBUSB_TRANSFER_CANCELLED ? "CANCELLED" : "UNKNOWN",
+                 activeTransfers.load(),
+                 ringBuffer ? ringBuffer->getAvailable() : 0);
+            lastTransferErrLogMs = now;
+        }
         int remaining = --activeTransfers;
         if (remaining <= 0) {
             LOGE("All isochronous transfers failed -- stopping streaming");
@@ -966,9 +1174,19 @@ void UsbAudioDriver::submitTransfer(int index) {
 
     uint32_t fb = currentFeedback.load(std::memory_order_relaxed);
     double fpp;
-    if (fb > 0) {
+    if (fb > 0 && !DISABLE_FEEDBACK) {
         // Feedback is in 16.16 format (UAC1 10.14 was converted to 16.16 on receipt)
         fpp = fb / 65536.0;
+
+        // Safety clamp: DACs should only deviate slightly from nominal rate.
+        // Real DAC clock drift is < 100 ppm (~0.01%); anything bigger than a
+        // couple of percent is noise from WinUSB scheduling jitter on the
+        // feedback EP. Wider clamps let that noise modulate packet sizes and
+        // produce continuous low-level crackle.
+        double minFpp = nominalFpp * 0.98;
+        double maxFpp = nominalFpp * 1.02;
+        if (fpp < minFpp) fpp = minFpp;
+        if (fpp > maxFpp) fpp = maxFpp;
     } else {
         fpp = nominalFpp;
     }
@@ -979,6 +1197,7 @@ void UsbAudioDriver::submitTransfer(int index) {
     int effectiveMaxPkt = basePktSize * mult;
 
     int totalFilled = 0;
+    bool underrun = false;
 
     // Fill each packet individually with feedback-adjusted frame count
     for (int p = 0; p < PACKETS_PER_TRANSFER; p++) {
@@ -993,16 +1212,64 @@ void UsbAudioDriver::submitTransfer(int index) {
 
         int offset = totalFilled;
         int got = 0;
-        if (ringBuffer) {
+        if (GEN_SINE_IN_SUBMIT) {
+            // A9 diagnostic: synthesize a 220 Hz sine with persistent phase,
+            // no ring read. Same clamp/scale/shift/pack as writeFloat32.
+            static double s_phase = 0.0;
+            const double twoPiFOverFs = 2.0 * 3.14159265358979323846 * 220.0
+                                      / (double)configuredRate;
+            int subslotBytes = configuredSubslotSize;
+            int padBits = subslotBytes * 8 - configuredBitDepth;
+            if (padBits < 0) padBits = 0;
+            int pktFrames = (bytesPerFrame > 0) ? packetBytes / bytesPerFrame : 0;
+            int o = offset;
+            for (int f = 0; f < pktFrames; f++) {
+                double sd = 0.2 * sin(s_phase);
+                s_phase += twoPiFOverFs;
+                if (s_phase > 2.0 * 3.14159265358979323846)
+                    s_phase -= 2.0 * 3.14159265358979323846;
+                int32_t v;
+                switch (configuredBitDepth) {
+                    case 16: v = (int32_t)(sd * 32767.0);      break;
+                    case 24: v = (int32_t)(sd * 8388607.0);    break;
+                    case 32: v = (int32_t)(sd * 2147483647.0); break;
+                    default: v = (int32_t)(sd * 32767.0);      break;
+                }
+                int32_t wire = (int32_t)((uint32_t)v << padBits);
+                for (int ch = 0; ch < configuredChannels; ch++) {
+                    for (int b = 0; b < subslotBytes; b++) {
+                        buf[o++] = (wire >> (b * 8)) & 0xFF;
+                    }
+                }
+            }
+            got = packetBytes;
+        } else if (SEND_SILENCE) {
+            // A4 diagnostic: payload is zeros, no ring read at all.
+            memset(buf + offset, 0, packetBytes);
+            got = packetBytes;
+        } else if (ringBuffer) {
             got = (int)ringBuffer->read(buf + offset, packetBytes);
+            if (got < 0) got = 0; // Prevent negative offsets and heap corruption!
         }
-        // Zero-fill remainder (silence)
         if (got < packetBytes) {
             memset(buf + offset + got, 0, packetBytes - got);
+            if (got < packetBytes && packetBytes > 0) underrun = true;
         }
 
         xfr->iso_packet_desc[p].length = packetBytes;
         totalFilled += packetBytes;
+    }
+
+    if (underrun) {
+        int count = playbackUnderruns.fetch_add(1, std::memory_order_relaxed) + 1;
+        uint32_t now = GetTickCount();
+        if (count <= 5 || (now - lastUnderrunLogMs) >= 1000) {
+            uint32_t fb = currentFeedback.load(std::memory_order_relaxed);
+            LOGE("playback underrun #%d (ring=%zu bytes, fpp=%.4f)",
+                 count, ringBuffer ? ringBuffer->getAvailable() : 0,
+                 fb / 65536.0);
+            lastUnderrunLogMs = now;
+        }
     }
 
     xfr->length = totalFilled;
@@ -1015,6 +1282,8 @@ void UsbAudioDriver::submitTransfer(int index) {
             LOGE("All transfers lost on resubmit -- stopping streaming");
             streaming.store(false);
         }
+    } else {
+        transfersInFlight.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -1052,6 +1321,25 @@ void UsbAudioDriver::handleFeedbackComplete(struct libusb_transfer* transfer) {
             if (prev == 0) {
                 double rate = fb / 65536.0;
                 LOGI("First feedback value: %.4f frames/packet (raw=0x%08x)", rate, fb);
+                lastStableFeedback = fb;
+            } else if (lastStableFeedback != 0) {
+                // Track large feedback excursions: throttled to once per second so
+                // a spike near a stutter is visible without flooding the log.
+                uint32_t stable = lastStableFeedback;
+                uint32_t diff = (fb > stable) ? (fb - stable) : (stable - fb);
+                // 2% of typical feedback magnitude is ~stable / 50.
+                if (diff > stable / 50) {
+                    uint32_t now = GetTickCount();
+                    if ((now - lastFeedbackLogMs) >= 1000) {
+                        LOGI("feedback jump: %.4f -> %.4f fpp (delta=%.4f)",
+                             stable / 65536.0, fb / 65536.0,
+                             (double)diff / 65536.0);
+                        lastFeedbackLogMs = now;
+                    }
+                }
+                // Slow-track the stable value: EMA with alpha ~ 1/16 so a spike
+                // doesn't immediately become the new baseline.
+                lastStableFeedback = (uint32_t)((uint64_t)stable * 15 / 16 + (uint64_t)fb / 16);
             }
         }
     } else if (transfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
@@ -1109,13 +1397,29 @@ bool UsbAudioDriver::start() {
          isHighSpeed ? "High" : "Full",
          nominalFpp, bytesPerPacket, uacVersion);
 
-    // Allocate ring buffer: 200ms of output audio (in wire-format bytes)
-    int ringSize = configuredRate * bytesPerFrame / 5; // 200ms
-    if (ringSize < 65536) ringSize = 65536;
-    delete ringBuffer;
-    ringBuffer = new RingBuffer(ringSize);
-    LOGI("Ring buffer allocated: %d bytes (%.0f ms)",
-         ringSize, ringSize * 1000.0 / (configuredRate * bytesPerFrame));
+    if (SEND_SILENCE) {
+        LOGI("SEND_SILENCE diagnostic: outgoing audio replaced with zeros (no ring read)");
+    }
+    if (WRITE_CONST_DATA) {
+        LOGI("WRITE_CONST_DATA diagnostic: writeFloat32 input replaced with constant 0.3 (DC)");
+    }
+    if (GEN_SINE_IN_SUBMIT) {
+        LOGI("GEN_SINE_IN_SUBMIT diagnostic: ring bypassed, 220 Hz sine synthesized in submitTransfer");
+    }
+
+    // Ring buffer is allocated in configure() so callers can pre-fill before
+    // start(). Fallback: allocate here if configure() was not called.
+    int ringSize = configuredRate * bytesPerFrame * 3; // 3 seconds
+    if (ringSize < 131072) ringSize = 131072;
+    if (!ringBuffer || (int)ringBuffer->getCapacity() != ringSize) {
+        delete ringBuffer;
+        ringBuffer = new RingBuffer(ringSize);
+        LOGI("Ring buffer allocated in start(): %d bytes (%.0f ms)",
+             ringSize, ringSize * 1000.0 / (configuredRate * bytesPerFrame));
+    } else {
+        LOGI("Ring buffer reused from configure(): %d bytes, %zu bytes pre-filled",
+             ringSize, ringBuffer->getAvailable());
+    }
 
     // Lock ring buffer pages to prevent page faults during streaming
     if (mlock(ringBuffer->getBuffer(), ringBuffer->getCapacity()) != 0) {
@@ -1195,6 +1499,31 @@ bool UsbAudioDriver::start() {
 
     transferBufSize = maxBufSize;
 
+#ifdef _WIN32
+    // Bump process working-set quota so VirtualLock can pin all 24 transfer
+    // buffers + the ring buffer + libusb internals. Default min working-set
+    // (~1.4 MB) is too small once the multi-MB ring is in play, which causes
+    // VirtualLock on the tail transfers to fail with ERROR_WORKING_SET_QUOTA.
+    // Pageable transfer buffers take page faults during iso scheduling,
+    // missing microframe deadlines and producing audible popcorn.
+    {
+        SIZE_T needed = (SIZE_T)ringSize
+                      + (SIZE_T)maxBufSize * NUM_TRANSFERS
+                      + 16 * 1024 * 1024; // headroom for libusb / heap / stack
+        SIZE_T minWs = needed < (SIZE_T)64 * 1024 * 1024
+                     ? (SIZE_T)64 * 1024 * 1024 : needed;
+        SIZE_T maxWs = minWs * 4;
+        if (!SetProcessWorkingSetSizeEx(GetCurrentProcess(), minWs, maxWs,
+                QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
+            LOGI("SetProcessWorkingSetSizeEx(%zu, %zu) failed: %lu",
+                 minWs, maxWs, GetLastError());
+        } else {
+            LOGI("Working set: min=%zu max=%zu (for VirtualLock budget)",
+                 minWs, maxWs);
+        }
+    }
+#endif
+
     for (int i = 0; i < NUM_TRANSFERS; i++) {
         transfers[i] = libusb_alloc_transfer(PACKETS_PER_TRANSFER);
         if (!transfers[i]) {
@@ -1207,7 +1536,12 @@ bool UsbAudioDriver::start() {
 
         // Lock transfer buffer pages
         if (mlock(transferBuffers[i], maxBufSize) != 0) {
+#ifdef _WIN32
+            LOGI("mlock transfer[%d] failed: GetLastError=%lu (non-fatal)",
+                 i, GetLastError());
+#else
             LOGI("mlock transfer[%d] failed: %s (non-fatal)", i, strerror(errno));
+#endif
         }
 
         libusb_fill_iso_transfer(transfers[i], handle,
@@ -1222,9 +1556,54 @@ bool UsbAudioDriver::start() {
     // Initialize feedback state
     feedbackAccumulator = 0.0;
     currentFeedback.store(0, std::memory_order_relaxed);
+    playbackUnderruns.store(0, std::memory_order_relaxed);
+
+    // Pre-fill transfer buffers from ring so first USB packets carry real audio.
+    // Track per-transfer real-vs-requested bytes so we can prove or rule out
+    // "pre-buffer too thin" as the cause of start-of-track popcorn.
+    {
+        double fpp = isHighSpeed
+            ? (configuredRate / 8000.0) : (configuredRate / 1000.0);
+        int fullTransfers = 0;
+        int totalReal = 0;
+        int totalReq  = 0;
+        for (int i = 0; i < NUM_TRANSFERS; i++) {
+            libusb_transfer* xfr = transfers[i];
+            uint8_t* buf = transferBuffers[i];
+            int totalFilled = 0;
+            int xfrReal = 0;
+            int xfrReq  = 0;
+            for (int p = 0; p < PACKETS_PER_TRANSFER; p++) {
+                feedbackAccumulator += fpp;
+                int frames = (int)feedbackAccumulator;
+                feedbackAccumulator -= frames;
+                int pktBytes = frames * bytesPerFrame;
+                if (pktBytes > effectiveMaxPkt) pktBytes = effectiveMaxPkt;
+                int got = ringBuffer
+                    ? (int)ringBuffer->read(buf + totalFilled, pktBytes) : 0;
+                if (got < pktBytes)
+                    memset(buf + totalFilled + got, 0, pktBytes - got);
+                xfr->iso_packet_desc[p].length = pktBytes;
+                totalFilled += pktBytes;
+                xfrReal += got;
+                xfrReq  += pktBytes;
+            }
+            xfr->length = totalFilled;
+            if (xfrReal == xfrReq) fullTransfers++;
+            totalReal += xfrReal;
+            totalReq  += xfrReq;
+        }
+        int pct = (totalReq > 0) ? (int)((100LL * totalReal) / totalReq) : 0;
+        LOGI("Pre-fill: %d/%d transfers full, avg fill %d%% (%d/%d bytes), ring=%zu bytes remaining",
+             fullTransfers, NUM_TRANSFERS, pct, totalReal, totalReq,
+             ringBuffer ? ringBuffer->getAvailable() : 0);
+    }
 
     streaming.store(true);
     activeTransfers.store(NUM_TRANSFERS);
+    transfersInFlight.store(0);
+    minInFlight = NUM_TRANSFERS;
+    lastInFlightLogMs = GetTickCount();
 
     // Submit all data transfers
     for (int i = 0; i < NUM_TRANSFERS; i++) {
@@ -1232,6 +1611,8 @@ bool UsbAudioDriver::start() {
         if (rc < 0) {
             LOGE("submit_transfer[%d] failed: %s", i, libusb_error_name(rc));
             activeTransfers--;
+        } else {
+            transfersInFlight.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -1245,7 +1626,10 @@ bool UsbAudioDriver::start() {
     LOGI("%d/%d initial transfers submitted", activeTransfers.load(), NUM_TRANSFERS);
 
     // Set up feedback endpoint if present (async mode)
-    if (activeFormat.feedbackEpAddr >= 0) {
+    if (DISABLE_FEEDBACK) {
+        LOGI("Feedback EP DISABLED for diagnostic (fpp pinned to nominal=%.4f)",
+             (isHighSpeed ? configuredRate / 8000.0 : configuredRate / 1000.0));
+    } else if (activeFormat.feedbackEpAddr >= 0) {
         int fbPktSize = (uacVersion == 2) ? 4 : 3;
         feedbackTransfer = libusb_alloc_transfer(1); // 1 iso packet
         if (feedbackTransfer) {
@@ -1288,19 +1672,38 @@ void UsbAudioDriver::ensureEventThread() {
         return;
     }
     eventThread = std::thread([this]() {
-        // THREAD_PRIORITY_URGENT_AUDIO equivalent (-19), no starvation risk
-        if (setpriority(PRIO_PROCESS, 0, -19) != 0) {
+#ifdef _WIN32
+        // MMCSS "Pro Audio" registers this thread with the Windows Multimedia
+        // Class Scheduler so it isn't preempted under load. Without this, the
+        // libusb iso refill thread misses its deadline → first packets ship
+        // partial silence → audible popcorn at start. Mirrors the decoder
+        // thread's pattern (see src/decoder.cpp).
+        DWORD taskIndex = 0;
+        HANDLE hTask = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+        if (!hTask)
+            LOGI("AvSetMmThreadCharacteristics(Pro Audio) failed: %lu", GetLastError());
+        else
+            LOGI("Event thread: MMCSS Pro Audio");
+        if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL))
+            LOGI("SetThreadPriority(TIME_CRITICAL) failed: %lu", GetLastError());
+        else
+            LOGI("Event thread: THREAD_PRIORITY_TIME_CRITICAL");
+#else
+        if (setpriority(PRIO_PROCESS, 0, -19) != 0)
             LOGI("setpriority(-19) failed: %s, using default", strerror(errno));
-        } else {
+        else
             LOGI("Event thread: nice=-19 (urgent audio)");
-        }
+#endif
 
         LOGI("Event thread started");
         while (eventThreadUsers.load(std::memory_order_acquire) > 0) {
-            struct timeval tv = {0, 10000}; // 10ms timeout
+            struct timeval tv = {0, 2000}; // 2ms timeout
             libusb_handle_events_timeout_completed(ctx, &tv, nullptr);
         }
         LOGI("Event thread exited");
+#ifdef _WIN32
+        if (hTask) AvRevertMmThreadCharacteristics(hTask);
+#endif
     });
 }
 
@@ -1316,7 +1719,7 @@ void UsbAudioDriver::releaseEventThread() {
 }
 
 int UsbAudioDriver::write(const uint8_t* data, int length) {
-    if (!streaming.load() || !ringBuffer) return -1;
+    if (!ringBuffer) return -1;
     // Align write to wire-frame boundary to prevent sample misalignment.
     // Caller is responsible for producing data already padded to subslot width
     // (e.g., DoP packer pads 24-bit-in-32 with LSB padding when subslot != 3).
@@ -1331,7 +1734,7 @@ int UsbAudioDriver::write(const uint8_t* data, int length) {
 }
 
 int UsbAudioDriver::writeFloat32(const float* data, int numSamples) {
-    if (!streaming.load() || !ringBuffer) return -1;
+    if (!ringBuffer) return -1;
 
     // subslotSize is the on-wire byte count per sample; bitDepth is the data range.
     // When subslot > bitDepth/8 (e.g., 24-bit-in-32-bit), unused bits are at the LSB
@@ -1344,28 +1747,37 @@ int UsbAudioDriver::writeFloat32(const float* data, int numSamples) {
     uint8_t convBuf[CHUNK * 4]; // max 4 bytes per sample
     int totalConsumed = 0;
 
-    while (totalConsumed < numSamples) {
-        int batch = std::min(CHUNK, numSamples - totalConsumed);
+    int bytesPerFrame = subslotBytes * configuredChannels;
 
+    while (totalConsumed < numSamples) {
         size_t space = ringBuffer->getFreeSpace();
-        int fitSamples = (int)(space / subslotBytes);
-        if (fitSamples <= 0) break;
-        batch = std::min(batch, fitSamples);
+        int alignedBytes = bytesPerFrame > 0
+            ? ((int)space / bytesPerFrame) * bytesPerFrame : (int)space;
+        int maxSamples = alignedBytes / subslotBytes;
+        if (maxSamples <= 0) break;
+        int batch = std::min({CHUNK, numSamples - totalConsumed, maxSamples});
 
         int outBytes = 0;
 
         const float gain = softwareGain.load(std::memory_order_relaxed);
         for (int i = 0; i < batch; i++) {
-            float s = data[totalConsumed + i] * gain;
-            if (s > 1.0f) s = 1.0f;
-            else if (s < -1.0f) s = -1.0f;
+            double sd = WRITE_CONST_DATA
+                ? 0.3
+                : std::max(-1.0, std::min(1.0, (double)(data[totalConsumed + i] * gain)));
+
+            // Startup fade-in: linear ramp 0 -> 1 over the first fadeSampleTarget_
+            // channel-samples written after configure().
+            if (fadeSampleCounter_ < fadeSampleTarget_) {
+                sd *= (double)fadeSampleCounter_ / (double)fadeSampleTarget_;
+                fadeSampleCounter_++;
+            }
 
             int32_t v;
             switch (configuredBitDepth) {
-                case 16: v = (int32_t)(s * 32767.0f);      break;
-                case 24: v = (int32_t)(s * 8388607.0f);    break;
-                case 32: v = (int32_t)(s * 2147483647.0f); break;
-                default: v = (int32_t)(s * 32767.0f);      break;
+                case 16: v = (int32_t)(sd * 32767.0);      break;
+                case 24: v = (int32_t)(sd * 8388607.0);    break;
+                case 32: v = (int32_t)(sd * 2147483647.0); break;
+                default: v = (int32_t)(sd * 32767.0);      break;
             }
             int32_t wire = v << padBits;
             for (int b = 0; b < subslotBytes; b++) {
@@ -1376,7 +1788,6 @@ int UsbAudioDriver::writeFloat32(const float* data, int numSamples) {
         int written = (int)ringBuffer->write(convBuf, outBytes);
         int samplesWritten = written / subslotBytes;
         totalConsumed += samplesWritten;
-
         if (samplesWritten < batch) break;
     }
 
@@ -1384,7 +1795,7 @@ int UsbAudioDriver::writeFloat32(const float* data, int numSamples) {
 }
 
 int UsbAudioDriver::writeInt16(const int16_t* data, int numSamples) {
-    if (!streaming.load() || !ringBuffer) return -1;
+    if (!ringBuffer) return -1;
 
     // Upscale 16-bit data into the DAC's wire format. The data is left-aligned
     // within the subslot (per UAC2: padding at LSB end). When the subslot is
@@ -1399,13 +1810,15 @@ int UsbAudioDriver::writeInt16(const int16_t* data, int numSamples) {
     uint8_t convBuf[CHUNK * 4]; // max 4 bytes per sample
     int totalConsumed = 0;
 
-    while (totalConsumed < numSamples) {
-        int batch = std::min(CHUNK, numSamples - totalConsumed);
+    int bytesPerFrame = subslotBytes * configuredChannels;
 
+    while (totalConsumed < numSamples) {
         size_t space = ringBuffer->getFreeSpace();
-        int fitSamples = (int)(space / subslotBytes);
-        if (fitSamples <= 0) break;
-        batch = std::min(batch, fitSamples);
+        int alignedBytes = bytesPerFrame > 0
+            ? ((int)space / bytesPerFrame) * bytesPerFrame : (int)space;
+        int maxSamples = alignedBytes / subslotBytes;
+        if (maxSamples <= 0) break;
+        int batch = std::min({CHUNK, numSamples - totalConsumed, maxSamples});
 
         int outBytes = 0;
 
@@ -1431,7 +1844,6 @@ int UsbAudioDriver::writeInt16(const int16_t* data, int numSamples) {
         int written = (int)ringBuffer->write(convBuf, outBytes);
         int samplesWritten = written / subslotBytes;
         totalConsumed += samplesWritten;
-
         if (samplesWritten < batch) break;
     }
 
@@ -1441,7 +1853,7 @@ int UsbAudioDriver::writeInt16(const int16_t* data, int numSamples) {
 int UsbAudioDriver::writeInt24Packed(const uint8_t* data, int numBytes) {
     // 24-bit packed PCM: 3 bytes little-endian signed per sample. Sample-align
     // to the next multiple of 3 from the caller; this method assumes whole samples.
-    if (!streaming.load() || !ringBuffer) return -1;
+    if (!ringBuffer) return -1;
     int numSamples = numBytes / 3;
     if (numSamples <= 0) return 0;
 
@@ -1453,12 +1865,15 @@ int UsbAudioDriver::writeInt24Packed(const uint8_t* data, int numBytes) {
     uint8_t convBuf[CHUNK * 4];
     int totalConsumed = 0;
 
+    int bytesPerFrame = subslotBytes * configuredChannels;
+
     while (totalConsumed < numSamples) {
-        int batch = std::min(CHUNK, numSamples - totalConsumed);
         size_t space = ringBuffer->getFreeSpace();
-        int fitSamples = (int)(space / subslotBytes);
-        if (fitSamples <= 0) break;
-        batch = std::min(batch, fitSamples);
+        int alignedBytes = bytesPerFrame > 0
+            ? ((int)space / bytesPerFrame) * bytesPerFrame : (int)space;
+        int maxSamples = alignedBytes / subslotBytes;
+        if (maxSamples <= 0) break;
+        int batch = std::min({CHUNK, numSamples - totalConsumed, maxSamples});
 
         const float gain = softwareGain.load(std::memory_order_relaxed);
         int outBytes = 0;
@@ -1500,7 +1915,7 @@ int UsbAudioDriver::writeInt24Packed(const uint8_t* data, int numBytes) {
 }
 
 int UsbAudioDriver::writeInt32(const int32_t* data, int numSamples) {
-    if (!streaming.load() || !ringBuffer) return -1;
+    if (!ringBuffer) return -1;
     if (numSamples <= 0) return 0;
 
     int subslotBytes = configuredSubslotSize;
@@ -1514,12 +1929,15 @@ int UsbAudioDriver::writeInt32(const int32_t* data, int numSamples) {
     uint8_t convBuf[CHUNK * 4];
     int totalConsumed = 0;
 
+    int bytesPerFrame = subslotBytes * configuredChannels;
+
     while (totalConsumed < numSamples) {
-        int batch = std::min(CHUNK, numSamples - totalConsumed);
         size_t space = ringBuffer->getFreeSpace();
-        int fitSamples = (int)(space / subslotBytes);
-        if (fitSamples <= 0) break;
-        batch = std::min(batch, fitSamples);
+        int alignedBytes = bytesPerFrame > 0
+            ? ((int)space / bytesPerFrame) * bytesPerFrame : (int)space;
+        int maxSamples = alignedBytes / subslotBytes;
+        if (maxSamples <= 0) break;
+        int batch = std::min({CHUNK, numSamples - totalConsumed, maxSamples});
 
         const float gain = softwareGain.load(std::memory_order_relaxed);
         int outBytes = 0;
@@ -1554,6 +1972,8 @@ void UsbAudioDriver::flush() {
 }
 
 void UsbAudioDriver::stop() {
+    LOGI("stop() called: streaming=%d eventThreadUsers=%d activeTransfers=%d",
+         streaming.load() ? 1 : 0, eventThreadUsers.load(), activeTransfers.load());
     if (!streaming.load() && eventThreadUsers.load() == 0) {
         // Already stopped -- avoid double-release of the event thread refcount.
         return;

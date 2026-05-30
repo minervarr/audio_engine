@@ -119,6 +119,12 @@ private:
     std::atomic<size_t> writePos;
 };
 
+struct UsbAudioDeviceInfo {
+    uint16_t vid;
+    uint16_t pid;
+    std::string name;
+};
+
 struct UsbAudioFormat {
     int interfaceNum;
     int altSetting;
@@ -140,7 +146,10 @@ public:
     UsbAudioDriver();
     ~UsbAudioDriver();
 
+    static std::vector<UsbAudioDeviceInfo> enumerateUsbAudioDevices();
+
     bool open(int fd);
+    bool open(uint16_t vid, uint16_t pid);  // Windows: open by VID/PID via libusb
     bool parseDescriptors();
     std::vector<int> getSupportedRates();
     bool configure(int sampleRate, int channels, int bitDepth, bool preferDsd = false);
@@ -158,6 +167,7 @@ public:
     int getConfiguredChannels() const { return configuredChannels; }
     int getConfiguredBitDepth() const { return configuredBitDepth; }
     int getConfiguredSubslotSize() const { return configuredSubslotSize; }
+    size_t ringAvailable() const { return ringBuffer ? ringBuffer->getAvailable() : 0; }
     int getUacVersion() const { return uacVersion; }
     std::string getDeviceInfo() const;
 
@@ -240,13 +250,29 @@ private:
     int16_t volumeResDbQ8 = 256;    // 1 dB step default
     std::atomic<float> softwareGain{1.0f};
 
-    // Isochronous transfer ring
-    static const int NUM_TRANSFERS = 8;
-    static const int PACKETS_PER_TRANSFER = 8;
+    // Isochronous transfer ring. 64 transfers x 8 packets = 64 ms of audio
+    // queued in the libusbK driver, so resubmission jitter can't drain the
+    // queue (libusbK chains queued ASAP iso transfers contiguously only while
+    // the queue stays non-empty).
+    static const int NUM_TRANSFERS = 64;
+    // 32 packets/transfer = 4 ms per iso transfer. CRITICAL on Windows: with
+    // the 1 ms transfers (8 packets) the original code used, libusbK could not
+    // stitch consecutive iso OUT transfers together gaplessly and produced a
+    // continuous "popcorn" crackle at every transfer seam. 4 ms transfers give
+    // the driver enough margin to chain them without gaps. (Android's kernel
+    // URB scheduler tolerated 1 ms; Windows/libusbK does not.)
+    static const int PACKETS_PER_TRANSFER = 32;
     struct libusb_transfer* transfers[NUM_TRANSFERS] = {};
     uint8_t* transferBuffers[NUM_TRANSFERS] = {};
     int transferBufSize = 0;
     std::atomic<int> activeTransfers{0};
+
+    // Diagnostic: number of transfers currently submitted (in flight). If this
+    // periodically dips toward 0 the queue is draining (resubmission too slow);
+    // if it stays high the click is a scheduling/seam issue, not a drain.
+    std::atomic<int> transfersInFlight{0};
+    int minInFlight = 1 << 30;
+    uint32_t lastInFlightLogMs = 0;
 
     // Feedback transfer
     struct libusb_transfer* feedbackTransfer = nullptr;
@@ -256,6 +282,20 @@ private:
 
     // Write buffer
     RingBuffer* ringBuffer = nullptr;
+
+    // Startup fade-in: ramp the first ~30 ms of audio from silence to full so
+    // playback doesn't begin with a hard 0->signal discontinuity (audible POP).
+    // Counted in channel-samples; only touched by the producer (writeFloat32).
+    int64_t fadeSampleCounter_ = 0;
+    int64_t fadeSampleTarget_ = 0;
+
+    std::atomic<int> playbackUnderruns{0};
+
+    // Diagnostic log throttles (ms wall-clock, 0 = never logged)
+    uint32_t lastUnderrunLogMs = 0;
+    uint32_t lastFeedbackLogMs = 0;
+    uint32_t lastTransferErrLogMs = 0;
+    uint32_t lastStableFeedback = 0;
 
     std::atomic<bool> streaming{false};
     std::thread eventThread;
