@@ -36,7 +36,19 @@ static inline void usleep(unsigned us) { Sleep(us < 1000 ? 1 : us / 1000); }
 #endif
 
 #include "libusb/libusb/libusb.h"
+#include <ctime>
 #include <cstring>
+
+// Portable millisecond timestamp (wraps every ~49 days, fine for intervals)
+static inline uint32_t millis_now() {
+#ifdef _WIN32
+    return millis_now();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint32_t>(ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL);
+#endif
+}
 #include <cmath>
 #include <algorithm>
 #include <unordered_map>
@@ -1106,7 +1118,7 @@ void UsbAudioDriver::handleTransferComplete(struct libusb_transfer* transfer) {
     {
         int now_inflight = transfersInFlight.fetch_sub(1, std::memory_order_relaxed) - 1;
         if (now_inflight < minInFlight) minInFlight = now_inflight;
-        uint32_t t = GetTickCount();
+        uint32_t t = millis_now();
         if ((t - lastInFlightLogMs) >= 1000) {
             LOGI("iso queue: min in-flight over last interval = %d / %d",
                  minInFlight, NUM_TRANSFERS);
@@ -1122,7 +1134,7 @@ void UsbAudioDriver::handleTransferComplete(struct libusb_transfer* transfer) {
 
     if (transfer->status != LIBUSB_TRANSFER_COMPLETED &&
         transfer->status != LIBUSB_TRANSFER_TIMED_OUT) {
-        uint32_t now = GetTickCount();
+        uint32_t now = millis_now();
         if ((now - lastTransferErrLogMs) >= 1000) {
             LOGE("Transfer status=%d (%s) active=%d ring=%zu",
                  transfer->status,
@@ -1262,7 +1274,7 @@ void UsbAudioDriver::submitTransfer(int index) {
 
     if (underrun) {
         int count = playbackUnderruns.fetch_add(1, std::memory_order_relaxed) + 1;
-        uint32_t now = GetTickCount();
+        uint32_t now = millis_now();
         if (count <= 5 || (now - lastUnderrunLogMs) >= 1000) {
             uint32_t fb = currentFeedback.load(std::memory_order_relaxed);
             LOGE("playback underrun #%d (ring=%zu bytes, fpp=%.4f)",
@@ -1329,7 +1341,7 @@ void UsbAudioDriver::handleFeedbackComplete(struct libusb_transfer* transfer) {
                 uint32_t diff = (fb > stable) ? (fb - stable) : (stable - fb);
                 // 2% of typical feedback magnitude is ~stable / 50.
                 if (diff > stable / 50) {
-                    uint32_t now = GetTickCount();
+                    uint32_t now = millis_now();
                     if ((now - lastFeedbackLogMs) >= 1000) {
                         LOGI("feedback jump: %.4f -> %.4f fpp (delta=%.4f)",
                              stable / 65536.0, fb / 65536.0,
@@ -1603,7 +1615,7 @@ bool UsbAudioDriver::start() {
     activeTransfers.store(NUM_TRANSFERS);
     transfersInFlight.store(0);
     minInFlight = NUM_TRANSFERS;
-    lastInFlightLogMs = GetTickCount();
+    lastInFlightLogMs = millis_now();
 
     // Submit all data transfers
     for (int i = 0; i < NUM_TRANSFERS; i++) {
