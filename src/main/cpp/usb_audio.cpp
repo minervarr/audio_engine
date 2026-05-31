@@ -42,7 +42,7 @@ static inline void usleep(unsigned us) { Sleep(us < 1000 ? 1 : us / 1000); }
 // Portable millisecond timestamp (wraps every ~49 days, fine for intervals)
 static inline uint32_t millis_now() {
 #ifdef _WIN32
-    return millis_now();
+    return (uint32_t)GetTickCount();
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
