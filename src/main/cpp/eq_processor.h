@@ -85,6 +85,30 @@ public:
 
     bool isEnabled() const { return enabled; }
 
+    // EQ int32 input and write to double[] without quantizing back.
+    // Used when a downstream stage (resample + dither) handles the final quantize.
+    void processToDouble(const int32_t* in, double* out, int count) {
+        if (channelCount == 2) {
+            for (int i = 0; i < count; i += 2) {
+                out[i]   = processSample(in[i]   * (1.0 / 2147483647.0), 0);
+                out[i+1] = processSample(in[i+1] * (1.0 / 2147483647.0), 1);
+            }
+            return;
+        }
+        int frames = count / channelCount;
+        for (int f = 0; f < frames; f++) {
+            int base = f * channelCount;
+            for (int ch = 0; ch < channelCount; ch++)
+                out[base+ch] = processSample(in[base+ch] * (1.0 / 2147483647.0), ch);
+        }
+    }
+
+    // Bypass: just scale int32 to double without filter math.
+    static void scaleToDouble(const int32_t* in, double* out, int count) {
+        for (int i = 0; i < count; i++)
+            out[i] = in[i] * (1.0 / 2147483647.0);
+    }
+
 private:
     struct Biquad {
         double b0, b1, b2, a1, a2;
