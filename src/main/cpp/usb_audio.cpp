@@ -139,7 +139,6 @@ bool UsbAudioDriver::open(int fd) {
     return true;
 }
 
-#ifdef _WIN32
 bool UsbAudioDriver::open(uint16_t vid, uint16_t pid) {
     if (opened) close();
 
@@ -171,7 +170,6 @@ bool UsbAudioDriver::open(uint16_t vid, uint16_t pid) {
     LOGI("USB device opened: VID=%04X PID=%04X", vid, pid);
     return true;
 }
-#endif
 
 std::vector<UsbAudioDeviceInfo> UsbAudioDriver::enumerateUsbAudioDevices() {
     std::vector<UsbAudioDeviceInfo> result;
