@@ -1253,8 +1253,8 @@ void UsbAudioDriver::submitTransfer(int index) {
                 }
             }
             got = packetBytes;
-        } else if (SEND_SILENCE) {
-            // A4 diagnostic: payload is zeros, no ring read at all.
+        } else if (SEND_SILENCE || isPaused.load(std::memory_order_relaxed)) {
+            // A4 diagnostic or paused: payload is zeros, no ring read at all.
             memset(buf + offset, 0, packetBytes);
             got = packetBytes;
         } else if (ringBuffer) {
@@ -1979,6 +1979,10 @@ void UsbAudioDriver::flush() {
     if (ringBuffer) {
         ringBuffer->clear();
     }
+}
+
+void UsbAudioDriver::setPaused(bool paused) {
+    isPaused.store(paused, std::memory_order_relaxed);
 }
 
 void UsbAudioDriver::stop() {

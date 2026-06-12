@@ -25,6 +25,7 @@ public class UsbAudioNative {
     public static native int nativeGetUacVersion(long handle);
     public static native String nativeGetDeviceInfo(long handle);
     public static native void nativeClose(long handle);
+    public static native void nativeSetPaused(long handle, boolean paused);
 
     public static native boolean nativeHasHardwareVolume(long handle);
     public static native boolean nativeHasHardwareMute(long handle);

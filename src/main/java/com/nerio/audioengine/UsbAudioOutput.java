@@ -522,12 +522,16 @@ public class UsbAudioOutput implements AudioOutput {
 
     @Override
     public void pause() {
-        // USB isochronous keeps running but we stop feeding data
+        if (nativeHandle != 0) {
+            UsbAudioNative.nativeSetPaused(nativeHandle, true);
+        }
     }
 
     @Override
     public void resume() {
-        // Resume feeding data
+        if (nativeHandle != 0) {
+            UsbAudioNative.nativeSetPaused(nativeHandle, false);
+        }
     }
 
     @Override

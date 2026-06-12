@@ -162,6 +162,7 @@ public:
     void flush();
     void stop();
     void close();
+    void setPaused(bool paused);
 
     int getConfiguredRate() const { return configuredRate; }
     int getConfiguredChannels() const { return configuredChannels; }
@@ -297,6 +298,7 @@ private:
     uint32_t lastTransferErrLogMs = 0;
     uint32_t lastStableFeedback = 0;
 
+    std::atomic<bool> isPaused{false};
     std::atomic<bool> streaming{false};
     std::thread eventThread;
     std::atomic<int> eventThreadUsers{0};
