@@ -35,6 +35,15 @@ public class UsbAudioNative {
     public static native boolean nativeSetHardwareMute(long handle, boolean muted);
     public static native void nativeSetSoftwareGain(long handle, float gain);
 
+    // True when the integer write paths pass samples through untouched
+    // (software gain at unity skips the float multiply/requantize entirely).
+    public static native boolean nativeIsBitPerfectPath(long handle);
+
+    // Latency/stability profile: 0 = LOW_LATENCY, 1 = STABLE (default).
+    // Sizes iso transfer queues and ring buffers for both directions.
+    // Must be called before configure()/startCapture(); ignored mid-stream.
+    public static native void nativeSetLatencyProfile(long handle, int profile);
+
     // Capture (ADC -> host)
     public static native boolean nativeConfigureCapture(long handle, int sampleRate, int channels, int bitDepth);
     public static native boolean nativeStartCapture(long handle);
@@ -53,4 +62,10 @@ public class UsbAudioNative {
     public static native int[] nativeGetSupportedOutputRates(long handle);
     public static native int[] nativeGetSupportedOutputBitDepths(long handle);
     public static native int[] nativeGetSupportedOutputChannelCounts(long handle);
+
+    // Full (rate, channels, bits) tuples flattened 3 ints per format. The
+    // per-axis lists above can't express coupled limits like "384 kHz only
+    // at 16-bit"; a best-format picker needs the real tuples.
+    public static native int[] nativeGetCaptureFormats(long handle);
+    public static native int[] nativeGetOutputFormats(long handle);
 }

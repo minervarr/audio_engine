@@ -36,9 +36,12 @@ private:
 // src: float samples (native endian)
 // dst: int16 samples (native endian)
 // sampleCount: number of samples (not frames)
-inline void floatToInt16Dither(const float* src, int16_t* dst, int sampleCount) {
-    DitherLCG rng;
-
+// rng: caller-owned dither state. Must persist across calls so the dither
+//      sequence continues from buffer to buffer; a fresh generator per call
+//      repeats the same noise pattern every buffer, which is audible as a
+//      correlated tone instead of flat noise.
+inline void floatToInt16Dither(const float* src, int16_t* dst, int sampleCount,
+                               DitherLCG& rng) {
 #if CONVERT_HAS_NEON
     // Process 4 samples at a time with NEON
     const float32x4_t scale = vdupq_n_f32(32767.0f);

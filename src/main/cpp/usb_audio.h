@@ -8,6 +8,8 @@
 #include <string>
 #include <thread>
 
+#include "audio_convert.h"
+
 struct libusb_device_handle;
 struct libusb_context;
 struct libusb_transfer;
@@ -183,6 +185,12 @@ public:
     bool setHwMute(bool muted);
     void setSoftwareGain(float gain) { softwareGain.store(gain, std::memory_order_relaxed); }
 
+    // True when the integer write paths pass samples through untouched
+    // (unity gain skips the float multiply/requantize entirely).
+    bool isUnityGainBitPerfect() const {
+        return softwareGain.load(std::memory_order_relaxed) >= 0.9999f;
+    }
+
     // --- Capture (ADC -> host) ---
     bool configureCapture(int sampleRate, int channels, int bitDepth);
     bool startCapture();
@@ -205,6 +213,20 @@ public:
     std::vector<int> getOutputRates() const;
     std::vector<int> getOutputBitDepths() const;
     std::vector<int> getOutputChannelCounts() const;
+
+    // Full (rate, channels, bits) tuples, flattened 3 ints per format. The
+    // per-axis getters above can't express coupled limits like "384 kHz only
+    // at 16-bit"; a best-format picker needs the real tuples.
+    std::vector<int> getCaptureFormatTuples() const;
+    std::vector<int> getOutputFormatTuples() const;
+
+    // Latency/stability profile: 0 = LOW_LATENCY, 1 = STABLE (default).
+    // Sizes the iso transfer queues and ring buffers for both directions.
+    // Takes effect at the next configure()/startCapture(); ignored (logged)
+    // while either direction is streaming.
+    static const int PROFILE_LOW_LATENCY = 0;
+    static const int PROFILE_STABLE = 1;
+    void setLatencyProfile(int profile);
 
 private:
     bool setInterfaceAltSetting(int interface_num, int alt_setting);
@@ -251,20 +273,25 @@ private:
     int16_t volumeResDbQ8 = 256;    // 1 dB step default
     std::atomic<float> softwareGain{1.0f};
 
-    // Isochronous transfer ring. 64 transfers x 8 packets = 64 ms of audio
-    // queued in the libusbK driver, so resubmission jitter can't drain the
-    // queue (libusbK chains queued ASAP iso transfers contiguously only while
-    // the queue stays non-empty).
-    static const int NUM_TRANSFERS = 64;
-    // 32 packets/transfer = 4 ms per iso transfer. CRITICAL on Windows: with
-    // the 1 ms transfers (8 packets) the original code used, libusbK could not
-    // stitch consecutive iso OUT transfers together gaplessly and produced a
-    // continuous "popcorn" crackle at every transfer seam. 4 ms transfers give
-    // the driver enough margin to chain them without gaps. (Android's kernel
-    // URB scheduler tolerated 1 ms; Windows/libusbK does not.)
-    static const int PACKETS_PER_TRANSFER = 32;
-    struct libusb_transfer* transfers[NUM_TRANSFERS] = {};
-    uint8_t* transferBuffers[NUM_TRANSFERS] = {};
+    // Isochronous transfer queue, sized by the latency profile (see
+    // setLatencyProfile). MAX_* constants size the arrays; the runtime
+    // members below select how much of each array a profile actually uses.
+    //
+    // STABLE (default) playback = 64 transfers x 32 packets. These exact
+    // values are load-bearing on Windows: 32 packets/transfer = 4 ms per iso
+    // transfer — with 1 ms transfers (8 packets) libusbK could not stitch
+    // consecutive iso OUT transfers together gaplessly and produced a
+    // continuous "popcorn" crackle at every transfer seam. The deep 64-deep
+    // queue keeps resubmission jitter from draining it. (Android's kernel
+    // URB scheduler tolerates much shallower queues.)
+    // LOW_LATENCY = 16 x 8, validated on Android only.
+    static const int MAX_NUM_TRANSFERS = 64;
+    static const int MAX_PACKETS_PER_TRANSFER = 32;
+    int numTransfers = 64;
+    int packetsPerTransfer = 32;
+    int playbackRingMs = 3000;
+    struct libusb_transfer* transfers[MAX_NUM_TRANSFERS] = {};
+    uint8_t* transferBuffers[MAX_NUM_TRANSFERS] = {};
     int transferBufSize = 0;
     std::atomic<int> activeTransfers{0};
 
@@ -289,6 +316,11 @@ private:
     // Counted in channel-samples; only touched by the producer (writeFloat32).
     int64_t fadeSampleCounter_ = 0;
     int64_t fadeSampleTarget_ = 0;
+
+    // TPDF dither state for writeFloat32's 16-bit quantize. Persistent across
+    // calls (a per-call generator repeats the same noise every buffer). Only
+    // touched by the producer thread, like the fade counter above.
+    DitherLCG ditherRng_;
 
     std::atomic<int> playbackUnderruns{0};
 
@@ -315,10 +347,17 @@ private:
     int capSubslotSize = 0;
     int capEffectiveMaxPkt = 0;
 
-    static const int CAP_NUM_TRANSFERS = 8;
-    static const int CAP_PACKETS_PER_TRANSFER = 8;
-    struct libusb_transfer* capTransfers[CAP_NUM_TRANSFERS] = {};
-    uint8_t* capTransferBuffers[CAP_NUM_TRANSFERS] = {};
+    // Capture transfer queue, profile-driven like the playback side. STABLE
+    // (default) = 16 x 16 with a 1 s ring so a stalled Java reader can't drop
+    // samples mid-take; LOW_LATENCY = 8 x 8 with a 200 ms ring (the original
+    // tuning) for live-monitor use.
+    static const int MAX_CAP_NUM_TRANSFERS = 16;
+    static const int MAX_CAP_PACKETS_PER_TRANSFER = 16;
+    int capNumTransfers = 16;
+    int capPacketsPerTransfer = 16;
+    int capRingMs = 1000;
+    struct libusb_transfer* capTransfers[MAX_CAP_NUM_TRANSFERS] = {};
+    uint8_t* capTransferBuffers[MAX_CAP_NUM_TRANSFERS] = {};
     int capTransferBufSize = 0;
     std::atomic<int> capActiveTransfers{0};
 

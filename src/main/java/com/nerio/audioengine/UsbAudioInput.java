@@ -4,7 +4,6 @@ import android.util.Log;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -18,7 +17,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@link #stop()} to tear down. {@link #release()} hands back the shared
  * native handle to the owning device.
  */
-public class UsbAudioInput {
+public class UsbAudioInput implements AudioInput {
 
     private static final String TAG = "UsbAudioInput";
     private static final int POLL_BUFFER_BYTES = 16 * 1024;
@@ -36,8 +35,7 @@ public class UsbAudioInput {
 
     private Thread recordThread;
     private volatile boolean recording;
-    private RandomAccessFile wavFile;
-    private long bytesWritten;
+    private WavFileWriter wavWriter;
     private volatile UsbAudioOutput monitorOut;
     private volatile int monitorOutChannels;
     private byte[] monitorExpandBuf;
@@ -159,10 +157,7 @@ public class UsbAudioInput {
         if (recording) return false;
         if (wavOut == null) throw new IOException("wavOut == null");
 
-        wavFile = new RandomAccessFile(wavOut, "rw");
-        wavFile.setLength(0);
-        writeWavHeader(wavFile, rate, channels, bitDepth);
-        bytesWritten = 0;
+        wavWriter = new WavFileWriter(wavOut, rate, channels, bitDepth, false);
         framesWritten.set(0);
 
         recording = true;
@@ -183,13 +178,13 @@ public class UsbAudioInput {
                 Thread.currentThread().interrupt();
             }
         }
-        RandomAccessFile f = wavFile;
-        wavFile = null;
-        if (f != null) {
+        WavFileWriter w = wavWriter;
+        wavWriter = null;
+        if (w != null) {
             try {
-                patchWavSizes(f, bytesWritten);
-                f.close();
-                Log.i(TAG, "stopRecording: wrote " + bytesWritten + " PCM bytes");
+                long bytes = w.getPcmBytes();
+                w.close();
+                Log.i(TAG, "stopRecording: wrote " + bytes + " PCM bytes");
             } catch (IOException e) {
                 Log.e(TAG, "wav close failed", e);
             }
@@ -234,8 +229,7 @@ public class UsbAudioInput {
                     outLen = got;
                     outBuf = wireBuf;
                 }
-                wavFile.write(outBuf, 0, outLen);
-                bytesWritten += outLen;
+                wavWriter.write(outBuf, 0, outLen);
                 int frameBytes = outBytesPerSample * channels;
                 if (frameBytes > 0) {
                     framesWritten.addAndGet(outLen / frameBytes);
@@ -311,50 +305,6 @@ public class UsbAudioInput {
             }
         }
         return o;
-    }
-
-    private static void writeWavHeader(RandomAccessFile f, int rate, int channels, int bitDepth)
-            throws IOException {
-        int bytesPerSample = (bitDepth + 7) / 8;
-        int blockAlign = channels * bytesPerSample;
-        int byteRate = rate * blockAlign;
-        // Canonical 44-byte PCM RIFF/WAVE. Sizes at offsets 4 and 40 stay zero
-        // until patchWavSizes() rewrites them on stopRecording().
-        f.writeBytes("RIFF");
-        writeIntLE(f, 0);                 // [4..7]   ChunkSize (patched)
-        f.writeBytes("WAVE");
-        f.writeBytes("fmt ");
-        writeIntLE(f, 16);                // Subchunk1Size = 16 for PCM
-        writeShortLE(f, (short) 1);       // AudioFormat = 1 (PCM)
-        writeShortLE(f, (short) channels);
-        writeIntLE(f, rate);
-        writeIntLE(f, byteRate);
-        writeShortLE(f, (short) blockAlign);
-        writeShortLE(f, (short) bitDepth);
-        f.writeBytes("data");
-        writeIntLE(f, 0);                 // [40..43] Subchunk2Size (patched)
-    }
-
-    private static void patchWavSizes(RandomAccessFile f, long pcmBytes) throws IOException {
-        long riffSize = 36 + pcmBytes;
-        if (riffSize > 0x7FFFFFFFL) riffSize = 0x7FFFFFFFL;
-        long dataSize = Math.min(pcmBytes, 0x7FFFFFFFL);
-        f.seek(4);
-        writeIntLE(f, (int) riffSize);
-        f.seek(40);
-        writeIntLE(f, (int) dataSize);
-    }
-
-    private static void writeIntLE(RandomAccessFile f, int v) throws IOException {
-        f.write(v & 0xFF);
-        f.write((v >>> 8) & 0xFF);
-        f.write((v >>> 16) & 0xFF);
-        f.write((v >>> 24) & 0xFF);
-    }
-
-    private static void writeShortLE(RandomAccessFile f, short v) throws IOException {
-        f.write(v & 0xFF);
-        f.write((v >>> 8) & 0xFF);
     }
 
     public int getConfiguredRate() { return rate; }

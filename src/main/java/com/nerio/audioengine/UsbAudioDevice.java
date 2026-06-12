@@ -37,6 +37,17 @@ public final class UsbAudioDevice {
     public long getNativeHandle() { return nativeHandle; }
 
     /**
+     * Sets the latency/stability profile for both directions (iso transfer
+     * queue depth and ring buffer sizes). Call before configure()/start();
+     * the native side ignores changes while either direction streams.
+     */
+    public void setLatencyProfile(LatencyProfile profile) {
+        if (nativeHandle != 0 && profile != null) {
+            UsbAudioNative.nativeSetLatencyProfile(nativeHandle, profile.nativeValue());
+        }
+    }
+
+    /**
      * Called by each view's {@code release()}. When the last view releases,
      * the native driver is closed.
      */

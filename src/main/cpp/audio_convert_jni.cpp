@@ -1,6 +1,9 @@
 #include <jni.h>
 #include "audio_convert.h"
 
+// Persists across calls; only the single AudioTrackOutput write thread uses it.
+static DitherLCG g_ditherRng;
+
 extern "C" {
 
 JNIEXPORT void JNICALL
@@ -18,7 +21,7 @@ Java_com_nerio_audioengine_AudioTrackOutput_nativeFloatToInt16(JNIEnv* env, jcla
     const float* srcFloats = reinterpret_cast<const float*>(src + srcOffset);
     int16_t* dstInt16 = reinterpret_cast<int16_t*>(dst);
 
-    floatToInt16Dither(srcFloats, dstInt16, sampleCount);
+    floatToInt16Dither(srcFloats, dstInt16, sampleCount, g_ditherRng);
 
     env->ReleasePrimitiveArrayCritical(dstArray, dst, 0);
     env->ReleasePrimitiveArrayCritical(srcArray, src, JNI_ABORT);

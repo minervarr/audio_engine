@@ -270,6 +270,12 @@ Java_com_nerio_audioengine_UsbAudioNative_nativeSetSoftwareGain(JNIEnv*, jclass,
     if (driver) driver->setSoftwareGain((float)gain);
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeIsBitPerfectPath(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    return (driver && driver->isUnityGainBitPerfect()) ? JNI_TRUE : JNI_FALSE;
+}
+
 // --- Capture (ADC -> host) ---
 
 JNIEXPORT jboolean JNICALL
@@ -385,6 +391,28 @@ Java_com_nerio_audioengine_UsbAudioNative_nativeGetSupportedOutputChannelCounts(
     auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
     if (!driver) return env->NewIntArray(0);
     return vecToJArray(env, driver->getOutputChannelCounts());
+}
+
+// Flattened (rate, channels, bits) tuples, 3 ints per supported format.
+JNIEXPORT jintArray JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetCaptureFormats(JNIEnv* env, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return env->NewIntArray(0);
+    return vecToJArray(env, driver->getCaptureFormatTuples());
+}
+
+JNIEXPORT jintArray JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetOutputFormats(JNIEnv* env, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (!driver) return env->NewIntArray(0);
+    return vecToJArray(env, driver->getOutputFormatTuples());
+}
+
+JNIEXPORT void JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeSetLatencyProfile(JNIEnv*, jclass,
+        jlong handle, jint profile) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    if (driver) driver->setLatencyProfile((int)profile);
 }
 
 } // extern "C"
