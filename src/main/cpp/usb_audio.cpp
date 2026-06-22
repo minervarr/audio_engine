@@ -2697,6 +2697,18 @@ void UsbAudioDriver::close() {
         stop();
     }
 
+    // Safety net before libusb_close/libusb_exit: make sure the event thread is
+    // actually stopped and joined. A mid-stream device DETACH can leave the
+    // eventThreadUsers refcount leaked > 0 (stopCapture()'s "already torn down"
+    // early-return skips releaseEventThread()), so the thread keeps spinning in
+    // libusb_handle_events. If it's still alive at libusb_exit(), libusb aborts
+    // destroying a still-held mutex ("pthread_mutex_destroy(mutex) == 0" assertion).
+    // The event loop polls with a 2 ms timeout, so this join returns promptly.
+    eventThreadUsers.store(0, std::memory_order_release);
+    if (eventThread.joinable()) {
+        eventThread.join();
+    }
+
     // Release AC interface if still held
     if (handle && acInterfaceClaimed) {
         libusb_release_interface(handle, acInterfaceNum);
