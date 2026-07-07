@@ -7,9 +7,26 @@
 #include <avrt.h>
 #pragma comment(lib, "avrt.lib")
 #include <cstdio>
-#define LOGI(...) do { printf("[INFO] " __VA_ARGS__); printf("\n"); fflush(stdout); } while(0)
-#define LOGE(...) do { fprintf(stderr, "[ERR] " __VA_ARGS__); fprintf(stderr, "\n"); fflush(stderr); } while(0)
-#define LOGD(...) do {} while(0)
+#include <mutex>
+#include <cstdarg>
+
+static std::mutex g_logMutex;
+static inline void file_log(const char* level, const char* fmt, ...) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    FILE* f = fopen("audio_engine.log", "a");
+    if (!f) return;
+    fprintf(f, "[%s] ", level);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(f, fmt, args);
+    va_end(args);
+    fprintf(f, "\n");
+    fclose(f);
+}
+
+#define LOGI(...) file_log("INFO", __VA_ARGS__)
+#define LOGE(...) file_log("ERR", __VA_ARGS__)
+#define LOGD(...) file_log("DEBUG", __VA_ARGS__)
 static inline int mlock(const void* addr, size_t len) {
     return VirtualLock((LPVOID)addr, len) ? 0 : -1;
 }
@@ -1167,6 +1184,10 @@ void UsbAudioDriver::handleTransferComplete(struct libusb_transfer* transfer) {
         return;
     }
 
+    // This transfer's real audio has now reached the DAC: move it from
+    // "in flight" to "played" before the slot is refilled by submitTransfer.
+    framesPlayed_.fetch_add((uint64_t)transferRealFrames_[idx], std::memory_order_relaxed);
+
     submitTransfer(idx);
 }
 
@@ -1208,6 +1229,7 @@ void UsbAudioDriver::submitTransfer(int index) {
 
     int totalFilled = 0;
     bool underrun = false;
+    int realBytes = 0;  // bytes sourced from the ring (real audio, not silence)
 
     // Fill each packet individually with feedback-adjusted frame count
     for (int p = 0; p < packetsPerTransfer; p++) {
@@ -1260,6 +1282,7 @@ void UsbAudioDriver::submitTransfer(int index) {
         } else if (ringBuffer) {
             got = (int)ringBuffer->read(buf + offset, packetBytes);
             if (got < 0) got = 0; // Prevent negative offsets and heap corruption!
+            realBytes += got;
         }
         if (got < packetBytes) {
             memset(buf + offset + got, 0, packetBytes - got);
@@ -1283,6 +1306,12 @@ void UsbAudioDriver::submitTransfer(int index) {
     }
 
     xfr->length = totalFilled;
+
+    // Credit this transfer's real audio to the drain accounting. Stored so the
+    // completion callback can move it from "in flight" to "played".
+    int realFrames = (bytesPerFrame > 0) ? (realBytes / bytesPerFrame) : 0;
+    transferRealFrames_[index] = realFrames;
+    framesSubmitted_.fetch_add((uint64_t)realFrames, std::memory_order_relaxed);
 
     int rc = libusb_submit_transfer(xfr);
     if (rc < 0) {
@@ -1577,6 +1606,10 @@ bool UsbAudioDriver::start() {
         int fullTransfers = 0;
         int totalReal = 0;
         int totalReq  = 0;
+        // Fresh drain accounting for this stream: the pre-fill below is the
+        // first batch of real frames handed to the iso queue.
+        framesSubmitted_.store(0, std::memory_order_relaxed);
+        framesPlayed_.store(0, std::memory_order_relaxed);
         for (int i = 0; i < numTransfers; i++) {
             libusb_transfer* xfr = transfers[i];
             uint8_t* buf = transferBuffers[i];
@@ -1602,6 +1635,9 @@ bool UsbAudioDriver::start() {
             if (xfrReal == xfrReq) fullTransfers++;
             totalReal += xfrReal;
             totalReq  += xfrReq;
+            transferRealFrames_[i] = (bytesPerFrame > 0) ? (xfrReal / bytesPerFrame) : 0;
+            framesSubmitted_.fetch_add((uint64_t)transferRealFrames_[i],
+                                       std::memory_order_relaxed);
         }
         int pct = (totalReq > 0) ? (int)((100LL * totalReal) / totalReq) : 0;
         LOGI("Pre-fill: %d/%d transfers full, avg fill %d%% (%d/%d bytes), ring=%zu bytes remaining",
@@ -1991,6 +2027,24 @@ void UsbAudioDriver::flush() {
     if (ringBuffer) {
         ringBuffer->clear();
     }
+    // Reset drain accounting: the ring is now empty and any in-flight transfers
+    // are being discarded, so their real frames must not count as pending.
+    framesSubmitted_.store(0, std::memory_order_relaxed);
+    framesPlayed_.store(0, std::memory_order_relaxed);
+    for (int i = 0; i < MAX_NUM_TRANSFERS; i++) transferRealFrames_[i] = 0;
+}
+
+int UsbAudioDriver::getPendingPlaybackMs() const {
+    if (!streaming.load(std::memory_order_relaxed) || configuredRate <= 0) return 0;
+    int bytesPerFrame = configuredSubslotSize * configuredChannels;
+    if (bytesPerFrame <= 0) return 0;
+    int64_t ringFrames = ringBuffer
+        ? (int64_t)(ringBuffer->getAvailable() / bytesPerFrame) : 0;
+    int64_t inFlight = (int64_t)framesSubmitted_.load(std::memory_order_relaxed)
+                     - (int64_t)framesPlayed_.load(std::memory_order_relaxed);
+    if (inFlight < 0) inFlight = 0;  // transient after flush() / counter reset
+    int64_t pendingFrames = ringFrames + inFlight;
+    return (int)(pendingFrames * 1000 / configuredRate);
 }
 
 void UsbAudioDriver::setPaused(bool paused) {

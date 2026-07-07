@@ -181,6 +181,15 @@ public class AudioTrackOutput implements AudioOutput {
     }
 
     @Override
+    public int getPendingPlaybackMs() {
+        // AudioTrack's MODE_STREAM buffer is only tens of ms, so the gap between
+        // "written" and "rendered" is negligible -- treat as already drained.
+        // (This is why end-of-track completion never fired noticeably early on
+        // the built-in speaker, unlike a deeply-buffered USB DAC.)
+        return 0;
+    }
+
+    @Override
     public void release() {
         if (audioTrack != null) {
             Log.d(TAG, "release");

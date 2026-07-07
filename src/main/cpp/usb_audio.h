@@ -171,6 +171,12 @@ public:
     int getConfiguredBitDepth() const { return configuredBitDepth; }
     int getConfiguredSubslotSize() const { return configuredSubslotSize; }
     size_t ringAvailable() const { return ringBuffer ? ringBuffer->getAvailable() : 0; }
+    // Milliseconds of real (non-silence) audio still buffered between write()
+    // and the DAC: ring-buffer occupancy plus the not-yet-played frames already
+    // handed to the isochronous queue. Returns 0 when not streaming. Lets the
+    // caller drain the queued tail before stop()/flush() so the last seconds of
+    // a track aren't discarded at end-of-track.
+    int getPendingPlaybackMs() const;
     int getUacVersion() const { return uacVersion; }
     std::string getDeviceInfo() const;
 
@@ -294,6 +300,17 @@ private:
     uint8_t* transferBuffers[MAX_NUM_TRANSFERS] = {};
     int transferBufSize = 0;
     std::atomic<int> activeTransfers{0};
+
+    // End-of-track drain accounting. framesSubmitted_ counts real audio frames
+    // handed to the iso queue (pre-fill + each resubmit); framesPlayed_ counts
+    // those frames once their transfer completes. Their difference is the real
+    // audio still in flight; added to ring occupancy it gives the true buffered
+    // tail (see getPendingPlaybackMs). transferRealFrames_[i] remembers how many
+    // real frames transfer i carried so completion can credit them. Written by
+    // the producer (pre-fill / write) and the libusb event thread.
+    std::atomic<uint64_t> framesSubmitted_{0};
+    std::atomic<uint64_t> framesPlayed_{0};
+    int transferRealFrames_[MAX_NUM_TRANSFERS] = {};
 
     // Diagnostic: number of transfers currently submitted (in flight). If this
     // periodically dips toward 0 the queue is draining (resubmission too slow);

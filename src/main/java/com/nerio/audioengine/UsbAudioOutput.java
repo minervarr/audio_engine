@@ -521,6 +521,12 @@ public class UsbAudioOutput implements AudioOutput {
     }
 
     @Override
+    public int getPendingPlaybackMs() {
+        if (nativeHandle == 0 || !started) return 0;
+        return UsbAudioNative.nativeGetPendingPlaybackMs(nativeHandle);
+    }
+
+    @Override
     public void pause() {
         if (nativeHandle != 0) {
             UsbAudioNative.nativeSetPaused(nativeHandle, true);

@@ -210,6 +210,12 @@ Java_com_nerio_audioengine_UsbAudioNative_nativeSetPaused(JNIEnv*, jclass, jlong
     if (driver) driver->setPaused(paused);
 }
 
+JNIEXPORT jint JNICALL
+Java_com_nerio_audioengine_UsbAudioNative_nativeGetPendingPlaybackMs(JNIEnv*, jclass, jlong handle) {
+    auto* driver = reinterpret_cast<UsbAudioDriver*>(handle);
+    return driver ? driver->getPendingPlaybackMs() : 0;
+}
+
 JNIEXPORT void JNICALL
 Java_com_nerio_audioengine_UsbAudioNative_nativeClose(JNIEnv*, jclass, jlong handle) {
     std::lock_guard<std::mutex> lock(driverMutex);

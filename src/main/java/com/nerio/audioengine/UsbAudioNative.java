@@ -27,6 +27,11 @@ public class UsbAudioNative {
     public static native void nativeClose(long handle);
     public static native void nativeSetPaused(long handle, boolean paused);
 
+    // Milliseconds of real audio still buffered (ring + in-flight iso queue)
+    // before the DAC. Lets the engine drain the tail at end-of-track instead of
+    // discarding it. See usb_audio.cpp::getPendingPlaybackMs.
+    public static native int nativeGetPendingPlaybackMs(long handle);
+
     public static native boolean nativeHasHardwareVolume(long handle);
     public static native boolean nativeHasHardwareMute(long handle);
     public static native int nativeGetVolumeMinDbQ8(long handle);

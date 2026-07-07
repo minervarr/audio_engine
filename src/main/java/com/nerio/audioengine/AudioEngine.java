@@ -1129,6 +1129,40 @@ public class AudioEngine {
         decodeThread.start();
     }
 
+    /**
+     * Block until the active output has rendered (almost) all the audio it was
+     * already handed, so the buffered tail isn't thrown away when the track
+     * ends. A USB DAC buffers up to several seconds (ring + iso queue); on
+     * AudioTrackOutput getPendingPlaybackMs() returns 0, so this is a no-op and
+     * the original near-instant completion on the built-in speaker is preserved.
+     *
+     * <p>Runs on the output thread and bails on stop/seek/pause (and a safety
+     * cap) so it can never stall a track change. Callers must NOT use this on
+     * the seamless same-format gapless path -- there the next track's samples
+     * are appended to the still-playing queue and draining would defeat it.
+     */
+    private void drainOutput() {
+        // Safety cap a little above the deepest buffer (3 s ring + iso queue).
+        long deadline = System.currentTimeMillis() + 8000;
+        while (!stopped && !seeking && playing) {
+            int pendingMs;
+            synchronized (outputLock) {
+                pendingMs = (output != null) ? output.getPendingPlaybackMs() : 0;
+            }
+            if (pendingMs <= 0) break;
+            if (System.currentTimeMillis() >= deadline) {
+                Log.w(TAG, "drainOutput: safety cap hit with " + pendingMs + "ms still pending");
+                break;
+            }
+            try {
+                Thread.sleep(Math.min(pendingMs, 30));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+    }
+
     private void startOutputThread() {
         Log.d(TAG, "output thread starting");
         outputThread = new Thread(() -> {
@@ -1156,6 +1190,16 @@ public class AudioEngine {
                             boolean formatMatch = (nextSampleRate == sampleRate
                                     && nextChannelCount == channelCount
                                     && nextEncoding == encoding);
+
+                            // A format change forces an output reconfigure, which
+                            // flushes the driver's buffer. Let the current track's
+                            // queued tail play out first (while the old format is
+                            // still configured) so it isn't truncated. Same-format
+                            // transitions skip this -- they stay seamless by
+                            // appending into the still-playing queue.
+                            if (!formatMatch) {
+                                drainOutput();
+                            }
 
                             // Release old decoder, promote next
                             synchronized (codecLock) {
@@ -1231,6 +1275,13 @@ public class AudioEngine {
                             continue;
                         }
 
+                        // No gapless successor queued: let the output finish
+                        // rendering its buffered tail before signalling
+                        // completion, otherwise the app's stop()/next-track
+                        // discards the last seconds still queued in the DAC.
+                        if (!stopped && !seeking) {
+                            drainOutput();
+                        }
                         if (!stopped && !seeking && onCompletionListener != null) {
                             onCompletionListener.onCompletion(this);
                         }
@@ -1274,7 +1325,22 @@ public class AudioEngine {
                         if (pos > 0 && !seeking) {
                             bytesWritten += pos;
                             if (cachedFrameSize > 0) {
-                                currentPositionUs = playbackBaseUs + (bytesWritten / cachedFrameSize) * 1_000_000L / sampleRate;
+                                // Position from bytes *written* to the output runs ahead by
+                                // however much the output still has buffered: a USB DAC swallows
+                                // ~3 s into its ring on the first writes, so an uncompensated
+                                // clock jumps straight to 00:03 at track start and reaches the
+                                // total several seconds before the audio actually ends. Subtract
+                                // the output's pending buffer so the clock reflects what the DAC
+                                // is really playing. (AudioTrackOutput reports 0 -> unchanged.)
+                                long writtenUs = (bytesWritten / cachedFrameSize) * 1_000_000L / sampleRate;
+                                long pendingUs;
+                                synchronized (outputLock) {
+                                    pendingUs = (output != null)
+                                            ? output.getPendingPlaybackMs() * 1000L : 0L;
+                                }
+                                long playedUs = writtenUs - pendingUs;
+                                if (playedUs < 0) playedUs = 0;
+                                currentPositionUs = playbackBaseUs + playedUs;
                             }
                         }
                     }
