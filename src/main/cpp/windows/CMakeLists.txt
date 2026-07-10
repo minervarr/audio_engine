@@ -35,6 +35,11 @@ target_include_directories(audio_engine_windows PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}/../libusb/libusb)
 
-target_compile_options(audio_engine_windows PRIVATE /W3 /O2)
+# No hardcoded /O2: CMAKE_BUILD_TYPE already selects the right optimization
+# level per config. Forcing /O2 unconditionally breaks a Debug build outright
+# here — MSVC's default Debug flags include /RTC1 (runtime checks), and cl.exe
+# fatal-errors (D8016) on the combination "/RTC1 and /O2 are incompatible"
+# rather than silently picking one.
+target_compile_options(audio_engine_windows PRIVATE /W3)
 
 target_link_libraries(audio_engine_windows PRIVATE usb1)
