@@ -76,6 +76,31 @@ target_link_libraries(audio_engine_alsa
     PRIVATE Threads::Threads)
 
 # ---------------------------------------------------------------------------
+# JACK2 capture backend — real libjack client to the user's running jackd.
+# NEVER pipewire-jack: after building, `ldd capture_jack_to_wav | grep jack`
+# must not mention pipewire.
+# ---------------------------------------------------------------------------
+option(AUDIO_ENGINE_ENABLE_JACK "Build the JACK2 capture backend (needs libjack from jack2, NOT pipewire-jack)" ON)
+if(AUDIO_ENGINE_ENABLE_JACK)
+    find_package(PkgConfig)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(JACK jack)
+    endif()
+    if(JACK_FOUND)
+        add_library(audio_engine_jack STATIC jack_capture.cpp)
+        target_include_directories(audio_engine_jack PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${JACK_INCLUDE_DIRS})
+        target_link_libraries(audio_engine_jack
+            PUBLIC ${JACK_LIBRARIES}
+            PRIVATE Threads::Threads)
+    else()
+        message(WARNING "libjack not found via pkg-config — skipping audio_engine_jack. Install jack2 (NOT pipewire-jack) and reconfigure.")
+        set(AUDIO_ENGINE_ENABLE_JACK OFF)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Smoke-test tools (list devices / capture N seconds to WAV)
 # ---------------------------------------------------------------------------
 option(AUDIO_ENGINE_BUILD_TOOLS "Build capture smoke-test executables" ON)
@@ -91,4 +116,12 @@ if(AUDIO_ENGINE_BUILD_TOOLS)
 
     add_executable(capture_alsa_to_wav tools/capture_alsa_to_wav.cpp)
     target_link_libraries(capture_alsa_to_wav audio_engine_alsa)
+
+    if(AUDIO_ENGINE_ENABLE_JACK)
+        add_executable(list_jack_ports tools/list_jack_ports.cpp)
+        target_link_libraries(list_jack_ports audio_engine_jack)
+
+        add_executable(capture_jack_to_wav tools/capture_jack_to_wav.cpp)
+        target_link_libraries(capture_jack_to_wav audio_engine_jack)
+    endif()
 endif()
