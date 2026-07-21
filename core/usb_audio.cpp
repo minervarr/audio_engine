@@ -36,7 +36,7 @@ static inline int munlock(const void* addr, size_t len) {
 static inline int setpriority(int, int, int) { return -1; }
 static inline void usleep(unsigned us) { Sleep(us < 1000 ? 1 : us / 1000); }
 #define PRIO_PROCESS 0
-#else
+#elif defined(__ANDROID__)
 #include <android/log.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -50,6 +50,21 @@ static inline void usleep(unsigned us) { Sleep(us < 1000 ? 1 : us / 1000); }
 // by default. Bump the logcat tag filter to `UsbAudio:D` when debugging
 // descriptor parsing or format selection.
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#else
+// Generic POSIX (desktop Linux, or any non-Android unix)
+#include <cstdio>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sched.h>
+#include <pthread.h>
+#define LOGI(...) do { fprintf(stderr, "[UsbAudio INFO] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+#define LOGE(...) do { fprintf(stderr, "[UsbAudio ERR] "  __VA_ARGS__); fputc('\n', stderr); } while (0)
+#ifdef USB_AUDIO_VERBOSE
+#define LOGD(...) do { fprintf(stderr, "[UsbAudio DEBUG] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+#else
+#define LOGD(...) do { } while (0)
+#endif
 #endif
 
 #include "libusb/libusb/libusb.h"
