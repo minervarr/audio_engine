@@ -64,6 +64,18 @@ target_link_libraries(audio_engine_linux
     PRIVATE Threads::Threads)
 
 # ---------------------------------------------------------------------------
+# ALSA capture backend — direct hardware, no sound server.
+# ---------------------------------------------------------------------------
+find_package(ALSA REQUIRED)
+add_library(audio_engine_alsa STATIC alsa_capture.cpp)
+target_include_directories(audio_engine_alsa PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${AE_CORE})
+target_link_libraries(audio_engine_alsa
+    PUBLIC ALSA::ALSA
+    PRIVATE Threads::Threads)
+
+# ---------------------------------------------------------------------------
 # Smoke-test tools (list devices / capture N seconds to WAV)
 # ---------------------------------------------------------------------------
 option(AUDIO_ENGINE_BUILD_TOOLS "Build capture smoke-test executables" ON)
@@ -73,4 +85,10 @@ if(AUDIO_ENGINE_BUILD_TOOLS)
 
     add_executable(capture_usb_to_wav tools/capture_usb_to_wav.cpp)
     target_link_libraries(capture_usb_to_wav audio_engine_linux)
+
+    add_executable(list_alsa_devices tools/list_alsa_devices.cpp)
+    target_link_libraries(list_alsa_devices audio_engine_alsa)
+
+    add_executable(capture_alsa_to_wav tools/capture_alsa_to_wav.cpp)
+    target_link_libraries(capture_alsa_to_wav audio_engine_alsa)
 endif()
