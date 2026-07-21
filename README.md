@@ -1,6 +1,6 @@
 # Audio Engine
 
-A high-fidelity Android audio playback library with USB DAC support, gapless playback, parametric EQ, and DSD format decoding. Written in Java + C++17 with JNI, targeting Android 7.0+.
+A high-fidelity audio engine. On Android: a playback library with USB DAC support, gapless playback, parametric EQ, and DSD format decoding (Java + C++17 with JNI, Android 7.0+). On desktop Windows/Linux: the same C++17 core consumed directly (no JNI), plus Linux capture backends — direct USB (libusb), ALSA, and JACK2.
 
 No external dependencies. No UI. Pure engine.
 
@@ -112,11 +112,12 @@ AudioOutput implementation
 
 ### As a Gradle Module
 
-In your project's `settings.gradle`:
+In your project's `settings.gradle` (the Gradle module lives under
+`platform/android/`):
 
 ```groovy
 include ':audio-engine'
-project(':audio-engine').projectDir = file('/path/to/audio-engine')
+project(':audio-engine').projectDir = file('/path/to/audio-engine/platform/android')
 ```
 
 In your app's `build.gradle`:
@@ -730,43 +731,47 @@ None. The library uses only:
 
 ## Project Structure
 
+One cross-platform core; per-platform builds split by build-system weight:
+`platform/` for anything heavier than a compiler (Android's Gradle),
+`scripts/<os>/` for plain cmake+ninja builds.
+
 ```
-audio-engine/
-|-- build.gradle                    Gradle build config (Android library module)
-|-- proguard-rules.pro              Keep rules for JNI
-|-- src/main/
-    |-- AndroidManifest.xml         Empty manifest (library)
-    |-- assets/
-    |   |-- eq_profiles.bin         Gzip JSON, hundreds of EQ profiles (~634KB)
-    |-- cpp/
-    |   |-- CMakeLists.txt          Native build config
-    |   |-- usb_audio.h             USB Audio Class driver (UAC1/UAC2)
-    |   |-- usb_audio.cpp           USB driver implementation (1039 lines)
-    |   |-- usb_audio_jni.cpp       JNI bridge for USB
-    |   |-- eq_processor.h          Biquad EQ with NEON SIMD (314 lines)
-    |   |-- eq_processor_jni.cpp    JNI bridge for EQ
-    |   |-- pcm_buffer.h            Ring buffer with mutex + CV (126 lines)
-    |   |-- pcm_buffer_jni.cpp      JNI bridge for ring buffer
-    |   |-- gapless_decoder.h       Encoder delay/padding trimmer (82 lines)
-    |   |-- gapless_decoder_jni.cpp JNI bridge for gapless
-    |   |-- audio_convert.h         Float->Int16 with TPDF dither (86 lines)
-    |   |-- audio_convert_jni.cpp   JNI bridge for conversion
-    |   |-- libusb/                 Vendored libusb source tree
-    |-- java/com/nerio/audioengine/
-        |-- MatrixPlayer.java       Simple facade (recommended entry point)
-        |-- AudioEngine.java        Core engine (1570 lines)
-        |-- AudioOutput.java        Output interface (8 methods)
-        |-- AudioTrackOutput.java   Speaker output
-        |-- UsbAudioOutput.java     USB DAC output
-        |-- UsbAudioNative.java     JNI declarations for USB
-        |-- NativePcmBuffer.java    Ring buffer JNI wrapper
-        |-- NativeGaplessDecoder.java  Gapless trim JNI wrapper
-        |-- EqProcessor.java        EQ processor (biquad coefficient computation)
-        |-- EqProfile.java          EQ profile data + asset loader
-        |-- DsfParser.java          Sony DSF parser
-        |-- DffParser.java          Philips DSDIFF parser
-        |-- SignalPathInfo.java      Signal chain metadata
+audio_engine/
+|-- core/                           Cross-platform C++ (no JNI, no OS UI deps)
+|   |-- usb_audio.h / .cpp          USB Audio Class driver (UAC1/UAC2, playback + capture)
+|   |-- eq_processor.h              Biquad EQ with NEON SIMD
+|   |-- pcm_buffer.h                Ring buffer with mutex + CV
+|   |-- audio_convert.h             Float->Int16 with TPDF dither
+|-- third_party/
+|   |-- libusb/                     Vendored libusb (git submodule)
+|-- scripts/
+|   |-- windows/CMakeLists.txt      Desktop Windows static lib (MSVC)
+|   |-- linux/                      Desktop Linux build + Linux-only capture backends
+|       |-- CMakeLists.txt          usb1 + core + ALSA + JACK2 + smoke tools
+|       |-- alsa_capture.h / .cpp   Direct-hardware ALSA capture (no sound server)
+|       |-- jack_capture.h / .cpp   JACK2 client capture (real libjack, never pipewire-jack)
+|       |-- tools/                  list/capture smoke-test executables
+|-- platform/
+    |-- android/                    The Android library module (Gradle + JNI)
+        |-- build.gradle
+        |-- src/main/cpp/           JNI bridges + Android CMake entry
+        |-- src/main/java/com/nerio/audioengine/   Java API (MatrixPlayer, AudioEngine, ...)
+        |-- src/main/assets/eq_profiles.bin
 ```
+
+## Desktop Linux capture backends
+
+`scripts/linux/` builds three ways to capture audio, all exposing the same
+`open -> configureCapture -> startCapture -> readCapture -> stopCapture ->
+close` surface (see `scripts/linux/README.md` for build prereqs and the
+smoke tools):
+
+- **USB (bit-perfect)** — `core/usb_audio.cpp` over libusb, straight to a
+  UAC1/UAC2 device, bypassing every OS sound layer.
+- **ALSA** — direct `hw:` device access, no sound server involved.
+- **JACK2** — a client of the `jackd` you start yourself (qjackctl); built
+  against real jack2's libjack, **never pipewire-jack**.
+
 ## License
 
 Copyright (C) 2026 nava.
