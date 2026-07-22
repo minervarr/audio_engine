@@ -8,7 +8,7 @@
 #include <ctime>
 #include <vector>
 
-#include "alsa_capture.h"
+#include "alsa_source.h"
 #include "wav_writer.h"
 
 int main(int argc, char** argv) {
@@ -20,24 +20,23 @@ int main(int argc, char** argv) {
     int seconds = atoi(argv[2]);
     const char* outPath = argv[3];
 
-    AlsaCaptureDriver driver;
+    AlsaSource driver;
     if (!driver.open(deviceId)) return 1;
 
     // 48 kHz stereo 16-bit request; the driver negotiates what the hardware
     // actually supports and reports the effective values.
-    if (!driver.configureCapture(48000, 2, 16)) {
+    if (!driver.configure({48000, 2, 16, 0, false})) {
         driver.close();
         return 1;
     }
-    if (!driver.startCapture()) {
+    if (!driver.start()) {
         driver.close();
         return 1;
     }
 
+    const ae::AudioFormat fmt = driver.activeFormat();
     WavWriter wav;
-    if (!wav.open(outPath, driver.getConfiguredCaptureRate(),
-                  driver.getConfiguredCaptureChannels(),
-                  driver.getConfiguredCaptureSubslotSize() * 8)) {
+    if (!wav.open(outPath, fmt.sampleRate, fmt.channels, fmt.subslotBytes * 8)) {
         fprintf(stderr, "error: cannot open %s for writing\n", outPath);
         driver.close();
         return 1;
@@ -46,7 +45,7 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> buf(8192);
     time_t end = time(nullptr) + seconds;
     while (time(nullptr) < end) {
-        int n = driver.readCapture(buf.data(), (int)buf.size());
+        int n = driver.read(buf.data(), (int)buf.size());
         if (n < 0) { fprintf(stderr, "error: readCapture hard failure\n"); break; }
         if (n == 0) continue;   // ring read already waits up to ~100 ms
         wav.write(buf.data(), (size_t)n);

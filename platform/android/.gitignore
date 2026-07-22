@@ -1,0 +1,15 @@
+# Gradle build outputs & caches -- the ACTUAL repo bloat. Never commit these.
+.gradle/
+build/
+.cxx/
+
+# Machine-local SDK/NDK paths -- per-developer, never committed.
+local.properties
+
+# IDE cruft
+*.iml
+.idea/
+
+# NOTE: the Gradle wrapper (gradlew, gradlew.bat, gradle/wrapper/*) is ~70 KB
+# and IS committed on purpose -- it's what lets anyone build with the exact
+# pinned Gradle version and no system Gradle install.

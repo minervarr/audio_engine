@@ -1,0 +1,9 @@
+{
+  "name": "audio_engine",
+  "description": "Cross-platform bit-perfect audio engine: one pure-C++ core, platforms as equal peers, shipped behind a stable C ABI.",
+  "version": "0.1.0",
+  "license": "UNLICENSED",
+  "platforms": ["linux", "android", "windows"],
+  "language": "C++17",
+  "public_api": "api/include/audio_engine.h"
+}

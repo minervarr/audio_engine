@@ -1,0 +1,25 @@
+// Self-contained Gradle build for the audio-engine Android library module.
+// This folder is a whole project (SDK/NDK/AGP), built from the CLI with the
+// wrapper -- no Android Studio required.
+pluginManagement {
+    repositories {
+        google {
+            content {
+                includeGroupByRegex "com\\.android.*"
+                includeGroupByRegex "com\\.google.*"
+                includeGroupByRegex "androidx.*"
+            }
+        }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "audioengine"

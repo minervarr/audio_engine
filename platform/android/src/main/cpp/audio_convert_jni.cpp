@@ -1,5 +1,5 @@
 #include <jni.h>
-#include "audio_convert.h"
+#include "core/dsp/audio_convert.h"
 
 // Persists across calls; only the single AudioTrackOutput write thread uses it.
 static DitherLCG g_ditherRng;

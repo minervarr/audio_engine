@@ -3,7 +3,7 @@
 
 #include <cstdint>
 #include <cstring>
-#include "pcm_buffer.h"
+#include "core/buffer/pcm_buffer.h"
 
 class GaplessDecoder {
 public:

@@ -731,46 +731,62 @@ None. The library uses only:
 
 ## Project Structure
 
-One cross-platform core; per-platform builds split by build-system weight:
-`platform/` for anything heavier than a compiler (Android's Gradle),
-`scripts/<os>/` for plain cmake+ninja builds.
+One shared C++ core, OS-specific IO behind two small interfaces, and a strict
+separation between **pure code** (`core/` + `backends/` + `tools/`), **the one
+heavy platform** (Android, a self-contained Gradle project under `platform/`),
+and **thin build launchers** (`scripts/`). All source lives in code folders;
+`scripts/` holds only per-OS build invocations.
 
 ```
 audio_engine/
-|-- core/                           Cross-platform C++ (no JNI, no OS UI deps)
-|   |-- usb_audio.h / .cpp          USB Audio Class driver (UAC1/UAC2, playback + capture)
-|   |-- eq_processor.h              Biquad EQ with NEON SIMD
-|   |-- pcm_buffer.h                Ring buffer with mutex + CV
-|   |-- audio_convert.h             Float->Int16 with TPDF dither
+|-- core/                           Pure C++17, std only, ZERO OS deps
+|   |-- audio_format.h              AudioFormat value type
+|   |-- audio_sink.h                AudioSink   interface (engine -> device, output)
+|   |-- audio_source.h              AudioSource interface (device -> engine, input)
+|   |-- dsp/
+|   |   |-- eq_processor.h          Biquad EQ with NEON SIMD
+|   |   |-- audio_convert.h         Float->Int16 with TPDF dither
+|   |-- buffer/
+|       |-- pcm_buffer.h            Blocking ring (mutex + CV) for decode -> output
+|       |-- ring_buffer.h           Lock-free SPSC ring, RT-safe (USB + JACK share it)
+|-- backends/                       OS/library-specific IO; each implements a core interface
+|   |-- usb/                        libusb UAC1/UAC2 driver (all platforms) + AudioSink/Source adapters
+|   |-- alsa/                       Linux: alsa_source (capture) + alsa_sink (playback)
+|   |-- jack/                       Linux: jack_source (capture) + jack_sink (playback), real libjack
+|   |-- wasapi/                     Windows (parked, Phase 3)
+|-- tools/                          Desktop smoke tools: list / capture / play (C++)
 |-- third_party/
 |   |-- libusb/                     Vendored libusb (git submodule)
-|-- scripts/
-|   |-- windows/CMakeLists.txt      Desktop Windows static lib (MSVC)
-|   |-- linux/                      Desktop Linux build + Linux-only capture backends
-|       |-- CMakeLists.txt          usb1 + core + ALSA + JACK2 + smoke tools
-|       |-- alsa_capture.h / .cpp   Direct-hardware ALSA capture (no sound server)
-|       |-- jack_capture.h / .cpp   JACK2 client capture (real libjack, never pipewire-jack)
-|       |-- tools/                  list/capture smoke-test executables
+|-- cmake/
+|   |-- ae_libusb.cmake             Single libusb build definition for every platform
+|   |-- libusb_config/config.h      Desktop Linux libusb config
+|-- CMakeLists.txt                  The whole desktop build (core + backends + tools)
+|-- scripts/                        Thin build launchers only, NO source
+|   |-- linux/build.sh              Invokes the root CMake (cmake + ninja)
+|   |-- windows/build.ps1           MSVC + ninja launcher (dormant, Phase 3)
 |-- platform/
-    |-- android/                    The Android library module (Gradle + JNI)
+    |-- android/                    Self-contained Android library module (Gradle + JNI)
         |-- build.gradle
-        |-- src/main/cpp/           JNI bridges + Android CMake entry
+        |-- src/main/cpp/           JNI bridges + Android CMake entry (reuses cmake/ae_libusb.cmake)
         |-- src/main/java/com/nerio/audioengine/   Java API (MatrixPlayer, AudioEngine, ...)
         |-- src/main/assets/eq_profiles.bin
 ```
 
-## Desktop Linux capture backends
+## Desktop Linux IO backends
 
-`scripts/linux/` builds three ways to capture audio, all exposing the same
-`open -> configureCapture -> startCapture -> readCapture -> stopCapture ->
-close` surface (see `scripts/linux/README.md` for build prereqs and the
-smoke tools):
+The desktop build (`scripts/linux/build.sh` -> root `CMakeLists.txt`) provides
+three full-duplex backends. Each implements the shared core interfaces —
+`ae::AudioSource` (`configure -> start -> read -> stop`) for capture and
+`ae::AudioSink` (`configure -> start -> write -> stop`) for playback (see
+`scripts/linux/README.md` for prereqs and the smoke tools):
 
-- **USB (bit-perfect)** — `core/usb_audio.cpp` over libusb, straight to a
-  UAC1/UAC2 device, bypassing every OS sound layer.
-- **ALSA** — direct `hw:` device access, no sound server involved.
+- **USB (bit-perfect)** — `backends/usb/usb_audio.cpp` over libusb, straight to
+  a UAC1/UAC2 device, bypassing every OS sound layer. Playback and capture.
+- **ALSA** — direct `hw:` device access, no sound server. `alsa_source`
+  (capture) + `alsa_sink` (playback).
 - **JACK2** — a client of the `jackd` you start yourself (qjackctl); built
-  against real jack2's libjack, **never pipewire-jack**.
+  against real jack2's libjack, **never pipewire-jack**. `jack_source`
+  (capture) + `jack_sink` (playback).
 
 ## License
 

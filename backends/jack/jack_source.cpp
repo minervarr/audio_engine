@@ -1,4 +1,4 @@
-#include "jack_capture.h"
+#include "jack_source.h"
 
 #include <jack/jack.h>
 
@@ -6,16 +6,16 @@
 #include <cstring>
 #include <algorithm>
 
-#define LOGI(...) do { fprintf(stderr, "[JackCapture INFO] " __VA_ARGS__); fputc('\n', stderr); } while (0)
-#define LOGE(...) do { fprintf(stderr, "[JackCapture ERR] "  __VA_ARGS__); fputc('\n', stderr); } while (0)
+#define LOGI(...) do { fprintf(stderr, "[JackSource INFO] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+#define LOGE(...) do { fprintf(stderr, "[JackSource ERR] "  __VA_ARGS__); fputc('\n', stderr); } while (0)
 
-JackCaptureDriver::JackCaptureDriver() = default;
+JackSource::JackSource() = default;
 
-JackCaptureDriver::~JackCaptureDriver() {
+JackSource::~JackSource() {
     close();
 }
 
-bool JackCaptureDriver::open(const std::string& clientName) {
+bool JackSource::open(const std::string& clientName) {
     if (client) close();
     jack_status_t status;
     // JackNoStartServer: connect to the user's running jackd only — never
@@ -33,7 +33,7 @@ bool JackCaptureDriver::open(const std::string& clientName) {
     return true;
 }
 
-std::vector<JackCapturePortInfo> JackCaptureDriver::enumerateCapturePorts() {
+std::vector<JackCapturePortInfo> JackSource::enumerateCapturePorts() {
     std::vector<JackCapturePortInfo> out;
     if (!client) return out;
     // Hardware capture sources are OUTPUT ports from the graph's viewpoint
@@ -48,23 +48,23 @@ std::vector<JackCapturePortInfo> JackCaptureDriver::enumerateCapturePorts() {
     return out;
 }
 
-bool JackCaptureDriver::configureCapture(int sampleRateHint, int channels, int bitDepthHint) {
+bool JackSource::configure(const ae::AudioFormat& fmt) {
     if (!client || streaming.load()) return false;
-    if (channels < 1) return false;
+    if (fmt.channels < 1) return false;
 
     int serverRate = (int)jack_get_sample_rate(client);
-    if (sampleRateHint > 0 && sampleRateHint != serverRate) {
-        LOGI("rate hint %d ignored — the JACK server runs at %d Hz", sampleRateHint, serverRate);
+    if (fmt.sampleRate > 0 && fmt.sampleRate != serverRate) {
+        LOGI("rate hint %d ignored — the JACK server runs at %d Hz", fmt.sampleRate, serverRate);
     }
-    if (bitDepthHint > 0 && bitDepthHint != 32) {
-        LOGI("bit-depth hint %d ignored — JACK processes float32", bitDepthHint);
+    if (fmt.bitDepth > 0 && fmt.bitDepth != 32) {
+        LOGI("bit-depth hint %d ignored — JACK processes float32", fmt.bitDepth);
     }
 
     // Drop ports from a previous configure.
     for (jack_port_t* p : inputPorts) jack_port_unregister(client, p);
     inputPorts.clear();
 
-    for (int i = 0; i < channels; ++i) {
+    for (int i = 0; i < fmt.channels; ++i) {
         char name[32];
         snprintf(name, sizeof(name), "in_%d", i + 1);
         jack_port_t* p = jack_port_register(client, name, JACK_DEFAULT_AUDIO_TYPE,
@@ -77,18 +77,20 @@ bool JackCaptureDriver::configureCapture(int sampleRateHint, int channels, int b
         }
         inputPorts.push_back(p);
     }
-    capChannels = channels;
+    capChannels = fmt.channels;
     return true;
 }
 
-bool JackCaptureDriver::startCapture(const std::vector<std::string>& sourcePorts) {
+bool JackSource::start() {
+    return start(std::vector<std::string>{});
+}
+
+bool JackSource::start(const std::vector<std::string>& sourcePorts) {
     if (!client || inputPorts.empty() || streaming.load()) return false;
 
     // 1 s float32 ring (same sizing philosophy as the other backends).
-    ringCapacity = (size_t)jack_get_sample_rate(client) * capChannels * sizeof(float);
-    ring = new uint8_t[ringCapacity];
-    ringRead.store(0);
-    ringWrite.store(0);
+    size_t ringCapacity = (size_t)jack_get_sample_rate(client) * capChannels * sizeof(float);
+    ring = new ae::RingBuffer(ringCapacity);
     overruns.store(0);
 
     // The callback interleaves into this scratch; sized for the server's
@@ -96,13 +98,13 @@ bool JackCaptureDriver::startCapture(const std::vector<std::string>& sourcePorts
     interleaveBuf.resize((size_t)jack_get_buffer_size(client) * capChannels);
 
     // Callback must be set before activate.
-    jack_set_process_callback(client, &JackCaptureDriver::processTrampoline, this);
+    jack_set_process_callback(client, &JackSource::processTrampoline, this);
 
     streaming.store(true, std::memory_order_release);
     if (jack_activate(client) != 0) {
         LOGE("jack_activate failed");
         streaming.store(false, std::memory_order_release);
-        delete[] ring;
+        delete ring;
         ring = nullptr;
         return false;
     }
@@ -118,7 +120,7 @@ bool JackCaptureDriver::startCapture(const std::vector<std::string>& sourcePorts
     }
     if ((int)sources.size() < capChannels) {
         LOGE("only %zu capture sources available for %d channels", sources.size(), capChannels);
-        stopCapture();
+        stop();
         return false;
     }
     for (int i = 0; i < capChannels; ++i) {
@@ -126,7 +128,7 @@ bool JackCaptureDriver::startCapture(const std::vector<std::string>& sourcePorts
         if (err != 0 && err != EEXIST) {
             LOGE("jack_connect(%s -> %s) failed (%d)", sources[i].c_str(),
                  jack_port_name(inputPorts[i]), err);
-            stopCapture();
+            stop();
             return false;
         }
         LOGI("connected %s -> %s", sources[i].c_str(), jack_port_name(inputPorts[i]));
@@ -134,13 +136,13 @@ bool JackCaptureDriver::startCapture(const std::vector<std::string>& sourcePorts
     return true;
 }
 
-int JackCaptureDriver::processTrampoline(uint32_t nframes, void* arg) {
-    return static_cast<JackCaptureDriver*>(arg)->process(nframes);
+int JackSource::processTrampoline(uint32_t nframes, void* arg) {
+    return static_cast<JackSource*>(arg)->process(nframes);
 }
 
 // REALTIME thread: no locks, no allocation, no I/O.
-int JackCaptureDriver::process(uint32_t nframes) {
-    if (!streaming.load(std::memory_order_acquire)) return 0;
+int JackSource::process(uint32_t nframes) {
+    if (!streaming.load(std::memory_order_acquire) || !ring) return 0;
 
     const int ch = capChannels;
     float* dst = interleaveBuf.data();
@@ -151,45 +153,27 @@ int JackCaptureDriver::process(uint32_t nframes) {
         }
     }
 
-    const uint8_t* data = (const uint8_t*)dst;
     size_t len = (size_t)nframes * ch * sizeof(float);
-
-    size_t r = ringRead.load(std::memory_order_acquire);
-    size_t w = ringWrite.load(std::memory_order_relaxed);
-    size_t space = (r + ringCapacity - w - 1) % ringCapacity;
-    if (len > space) {
-        overruns.fetch_add(1, std::memory_order_relaxed);
-        len = space;   // drop the tail; consumer stalled
+    size_t written = ring->write((const uint8_t*)dst, len);
+    if (written < len) {
+        overruns.fetch_add(1, std::memory_order_relaxed);   // consumer stalled
     }
-    size_t first = std::min(len, ringCapacity - w);
-    memcpy(ring + w, data, first);
-    if (len > first) memcpy(ring, data + first, len - first);
-    ringWrite.store((w + len) % ringCapacity, std::memory_order_release);
     return 0;
 }
 
-int JackCaptureDriver::readCapture(uint8_t* out, int maxBytes) {
+int JackSource::read(uint8_t* out, int maxBytes) {
     if (!ring) return -1;
     if (!streaming.load(std::memory_order_acquire)) return -1;
 
-    size_t w = ringWrite.load(std::memory_order_acquire);
-    size_t r = ringRead.load(std::memory_order_relaxed);
-    size_t avail = (w + ringCapacity - r) % ringCapacity;
-
     // Frame-align so consumers never see a torn float/frame.
     const size_t frameBytes = (size_t)capChannels * sizeof(float);
-    size_t want = std::min((size_t)maxBytes, avail);
+    size_t want = std::min((size_t)maxBytes, ring->getAvailable());
     want -= want % frameBytes;
     if (want == 0) return 0;
-
-    size_t first = std::min(want, ringCapacity - r);
-    memcpy(out, ring + r, first);
-    if (want > first) memcpy(out + first, ring, want - first);
-    ringRead.store((r + want) % ringCapacity, std::memory_order_release);
-    return (int)want;
+    return (int)ring->read(out, want);
 }
 
-void JackCaptureDriver::stopCapture() {
+void JackSource::stop() {
     if (!client) return;
     streaming.store(false, std::memory_order_release);
     if (activated) {
@@ -199,14 +183,13 @@ void JackCaptureDriver::stopCapture() {
     }
     int n = overruns.load();
     if (n > 0) LOGI("capture ended with %d ring overruns (consumer too slow)", n);
-    delete[] ring;
+    delete ring;
     ring = nullptr;
-    ringCapacity = 0;
 }
 
-void JackCaptureDriver::close() {
+void JackSource::close() {
     if (!client) return;
-    stopCapture();
+    stop();
     for (jack_port_t* p : inputPorts) jack_port_unregister(client, p);
     inputPorts.clear();
     jack_client_close(client);
@@ -214,6 +197,7 @@ void JackCaptureDriver::close() {
     capChannels = 0;
 }
 
-int JackCaptureDriver::getConfiguredCaptureRate() const {
-    return client ? (int)jack_get_sample_rate(client) : 0;
+ae::AudioFormat JackSource::activeFormat() const {
+    int rate = client ? (int)jack_get_sample_rate(client) : 0;
+    return { rate, capChannels, 32, 4, true };
 }

@@ -1,5 +1,5 @@
 #include <jni.h>
-#include "eq_processor.h"
+#include "core/dsp/eq_processor.h"
 #include <android/log.h>
 
 #define LOG_TAG "EqProcessor"

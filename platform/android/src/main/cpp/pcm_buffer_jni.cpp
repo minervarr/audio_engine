@@ -1,5 +1,5 @@
 #include <jni.h>
-#include "pcm_buffer.h"
+#include "core/buffer/pcm_buffer.h"
 #include <android/log.h>
 
 #define LOG_TAG "NativePcmBuffer"

@@ -10,7 +10,7 @@
 #include <vector>
 #include <unistd.h>
 
-#include "jack_capture.h"
+#include "jack_source.h"
 #include "wav_writer.h"
 
 int main(int argc, char** argv) {
@@ -22,12 +22,12 @@ int main(int argc, char** argv) {
     const char* outPath = argv[2];
     int channels = (argc == 4) ? atoi(argv[3]) : 1;
 
-    JackCaptureDriver driver;
+    JackSource driver;
     if (!driver.open("audio_engine_capture")) return 1;
-    if (!driver.configureCapture(0, channels, 0)) { driver.close(); return 1; }
-    if (!driver.startCapture()) { driver.close(); return 1; }
+    if (!driver.configure({0, channels, 0, 4, true})) { driver.close(); return 1; }
+    if (!driver.start()) { driver.close(); return 1; }
 
-    int rate = driver.getConfiguredCaptureRate();
+    int rate = driver.activeFormat().sampleRate;
     printf("capturing %d s at %d Hz, %d ch (float32 -> S16 WAV)\n",
            seconds, rate, channels);
 
@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
     std::vector<int16_t> pcm(raw.size() / sizeof(float));
     time_t end = time(nullptr) + seconds;
     while (time(nullptr) < end) {
-        int n = driver.readCapture(raw.data(), (int)raw.size());
+        int n = driver.read(raw.data(), (int)raw.size());
         if (n < 0) { fprintf(stderr, "error: readCapture hard failure\n"); break; }
         if (n == 0) { usleep(5 * 1000); continue; }
 

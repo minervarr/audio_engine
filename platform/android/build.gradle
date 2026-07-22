@@ -4,11 +4,9 @@ plugins {
 
 android {
     namespace 'com.nerio.audioengine'
-    compileSdk {
-        version = release(36) {
-            minorApiLevel = 1
-        }
-    }
+    // Pin the installed NDK explicitly; AGP's per-version default won't match.
+    ndkVersion '29.0.14206865'
+    compileSdk 35
 
     defaultConfig {
         minSdk 24

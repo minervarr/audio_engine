@@ -1,0 +1,7 @@
+# Single knob for the Android Gradle Plugin version. build.gradle refers to
+# this via alias(libs.plugins.android.library).
+[versions]
+agp = "8.13.0"
+
+[plugins]
+android-library = { id = "com.android.library", version.ref = "agp" }

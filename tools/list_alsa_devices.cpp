@@ -1,10 +1,10 @@
 // Smoke test: list ALSA capture-capable devices (direct hw: access).
 
 #include <cstdio>
-#include "alsa_capture.h"
+#include "alsa_source.h"
 
 int main() {
-    auto devices = AlsaCaptureDriver::enumerateCaptureDevices();
+    auto devices = AlsaSource::enumerateCaptureDevices();
     if (devices.empty()) {
         printf("No ALSA capture devices found.\n");
         return 0;

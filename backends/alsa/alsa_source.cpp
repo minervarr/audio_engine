@@ -1,51 +1,22 @@
-#include "alsa_capture.h"
-#include "pcm_buffer.h"
+#include "alsa_source.h"
+#include "core/buffer/pcm_buffer.h"
 
 #include <alsa/asoundlib.h>
 
 #include <cstdio>
 
-#define LOGI(...) do { fprintf(stderr, "[AlsaCapture INFO] " __VA_ARGS__); fputc('\n', stderr); } while (0)
-#define LOGE(...) do { fprintf(stderr, "[AlsaCapture ERR] "  __VA_ARGS__); fputc('\n', stderr); } while (0)
+#include "alsa_format.h"
 
-namespace {
+#define LOGI(...) do { fprintf(stderr, "[AlsaSource INFO] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+#define LOGE(...) do { fprintf(stderr, "[AlsaSource ERR] "  __VA_ARGS__); fputc('\n', stderr); } while (0)
 
-snd_pcm_format_t formatForBits(int bits) {
-    switch (bits) {
-        case 16: return SND_PCM_FORMAT_S16_LE;
-        case 24: return SND_PCM_FORMAT_S24_3LE;   // packed 3-byte, no padding
-        case 32: return SND_PCM_FORMAT_S32_LE;
-        default: return SND_PCM_FORMAT_UNKNOWN;
-    }
-}
+AlsaSource::AlsaSource() = default;
 
-int wireBytesForFormat(snd_pcm_format_t f) {
-    switch (f) {
-        case SND_PCM_FORMAT_S16_LE:  return 2;
-        case SND_PCM_FORMAT_S24_3LE: return 3;
-        case SND_PCM_FORMAT_S32_LE:  return 4;
-        default:                     return 0;
-    }
-}
-
-int bitsForFormat(snd_pcm_format_t f) {
-    switch (f) {
-        case SND_PCM_FORMAT_S16_LE:  return 16;
-        case SND_PCM_FORMAT_S24_3LE: return 24;
-        case SND_PCM_FORMAT_S32_LE:  return 32;
-        default:                     return 0;
-    }
-}
-
-} // namespace
-
-AlsaCaptureDriver::AlsaCaptureDriver() = default;
-
-AlsaCaptureDriver::~AlsaCaptureDriver() {
+AlsaSource::~AlsaSource() {
     close();
 }
 
-std::vector<AlsaCaptureDeviceInfo> AlsaCaptureDriver::enumerateCaptureDevices() {
+std::vector<AlsaCaptureDeviceInfo> AlsaSource::enumerateCaptureDevices() {
     std::vector<AlsaCaptureDeviceInfo> out;
 
     int card = -1;
@@ -84,7 +55,7 @@ std::vector<AlsaCaptureDeviceInfo> AlsaCaptureDriver::enumerateCaptureDevices() 
     return out;
 }
 
-bool AlsaCaptureDriver::open(const std::string& deviceId) {
+bool AlsaSource::open(const std::string& deviceId) {
     if (opened) close();
     int err = snd_pcm_open(&pcm, deviceId.c_str(), SND_PCM_STREAM_CAPTURE, 0);
     if (err < 0) {
@@ -96,8 +67,11 @@ bool AlsaCaptureDriver::open(const std::string& deviceId) {
     return true;
 }
 
-bool AlsaCaptureDriver::configureCapture(int sampleRate, int channels, int bitDepth) {
+bool AlsaSource::configure(const ae::AudioFormat& fmt) {
     if (!opened || streaming.load()) return false;
+    const int sampleRate = fmt.sampleRate;
+    const int channels   = fmt.channels;
+    const int bitDepth   = fmt.bitDepth;
 
     snd_pcm_hw_params_t* hw = nullptr;
     snd_pcm_hw_params_alloca(&hw);
@@ -109,16 +83,16 @@ bool AlsaCaptureDriver::configureCapture(int sampleRate, int channels, int bitDe
     if (err < 0) { LOGE("set_access: %s", snd_strerror(err)); return false; }
 
     // Requested format first, then fall back through the others.
-    snd_pcm_format_t fmt = formatForBits(bitDepth);
-    if (fmt == SND_PCM_FORMAT_UNKNOWN) { LOGE("unsupported bitDepth %d", bitDepth); return false; }
-    if (snd_pcm_hw_params_set_format(pcm, hw, fmt) < 0) {
+    snd_pcm_format_t pcmFmt = ae_alsa_formatForBits(bitDepth);
+    if (pcmFmt == SND_PCM_FORMAT_UNKNOWN) { LOGE("unsupported bitDepth %d", bitDepth); return false; }
+    if (snd_pcm_hw_params_set_format(pcm, hw, pcmFmt) < 0) {
         const snd_pcm_format_t fallbacks[] = {
             SND_PCM_FORMAT_S32_LE, SND_PCM_FORMAT_S24_3LE, SND_PCM_FORMAT_S16_LE };
         bool ok = false;
         for (snd_pcm_format_t f : fallbacks) {
-            if (f != fmt && snd_pcm_hw_params_set_format(pcm, hw, f) >= 0) {
-                LOGI("format %d-bit refused, using %d-bit", bitDepth, bitsForFormat(f));
-                fmt = f;
+            if (f != pcmFmt && snd_pcm_hw_params_set_format(pcm, hw, f) >= 0) {
+                LOGI("format %d-bit refused, using %d-bit", bitDepth, ae_alsa_bitsForFormat(f));
+                pcmFmt = f;
                 ok = true;
                 break;
             }
@@ -148,8 +122,8 @@ bool AlsaCaptureDriver::configureCapture(int sampleRate, int channels, int bitDe
 
     capRate = (int)rate;
     capChannels = (int)ch;
-    capBitDepth = bitsForFormat(fmt);
-    capSubslotSize = wireBytesForFormat(fmt);
+    capBitDepth = ae_alsa_bitsForFormat(pcmFmt);
+    capSubslotSize = ae_alsa_wireBytesForFormat(pcmFmt);
     configured = true;
 
     LOGI("configured %d Hz, %d ch, %d-bit (%d bytes/sample on the wire)",
@@ -161,7 +135,7 @@ bool AlsaCaptureDriver::configureCapture(int sampleRate, int channels, int bitDe
     return true;
 }
 
-bool AlsaCaptureDriver::startCapture() {
+bool AlsaSource::start() {
     if (!configured || streaming.load()) return false;
 
     int err = snd_pcm_prepare(pcm);
@@ -173,11 +147,11 @@ bool AlsaCaptureDriver::startCapture() {
     ring = new NativePcmBuffer(bytesPerSecond);
 
     streaming.store(true, std::memory_order_release);
-    readerThread = std::thread(&AlsaCaptureDriver::readerThreadFn, this);
+    readerThread = std::thread(&AlsaSource::readerThreadFn, this);
     return true;
 }
 
-void AlsaCaptureDriver::readerThreadFn() {
+void AlsaSource::readerThreadFn() {
     const int frameBytes = capChannels * capSubslotSize;
     const snd_pcm_uframes_t chunkFrames = (snd_pcm_uframes_t)(capRate / 50); // ~20 ms
     std::vector<uint8_t> buf((size_t)chunkFrames * frameBytes);
@@ -197,20 +171,20 @@ void AlsaCaptureDriver::readerThreadFn() {
             break;
         }
         if (got == 0) continue;
-        // Blocks when the ring is full; flush() in stopCapture() unblocks it.
+        // Blocks when the ring is full; flush() in stop() unblocks it.
         ring->write(buf.data(), 0, (int)(got * frameBytes));
     }
     streaming.store(false, std::memory_order_release);
 }
 
-int AlsaCaptureDriver::readCapture(uint8_t* out, int maxBytes) {
+int AlsaSource::read(uint8_t* out, int maxBytes) {
     if (!ring) return -1;
     if (!streaming.load(std::memory_order_acquire)) return -1;
     int n = ring->read(out, 0, maxBytes);
     return n < 0 ? 0 : n;   // flush/end sentinels are not hard failures here
 }
 
-void AlsaCaptureDriver::stopCapture() {
+void AlsaSource::stop() {
     if (!streaming.load() && !readerThread.joinable()) return;
     streaming.store(false, std::memory_order_release);
     if (pcm) snd_pcm_drop(pcm);
@@ -220,8 +194,8 @@ void AlsaCaptureDriver::stopCapture() {
     ring = nullptr;
 }
 
-void AlsaCaptureDriver::close() {
-    stopCapture();
+void AlsaSource::close() {
+    stop();
     if (pcm) {
         snd_pcm_close(pcm);
         pcm = nullptr;

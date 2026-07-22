@@ -2,10 +2,10 @@
 // Requires jackd already running (e.g. via qjackctl).
 
 #include <cstdio>
-#include "jack_capture.h"
+#include "jack_source.h"
 
 int main() {
-    JackCaptureDriver driver;
+    JackSource driver;
     if (!driver.open("audio_engine_list")) {
         fprintf(stderr, "No running JACK server (start it with qjackctl first).\n");
         return 1;
@@ -15,7 +15,7 @@ int main() {
         printf("Server running, but no physical capture ports found.\n");
     } else {
         printf("Physical capture ports (server rate %d Hz):\n",
-               driver.getConfiguredCaptureRate());
+               driver.activeFormat().sampleRate);
         for (const auto& p : ports) {
             printf("  %s\n", p.portName.c_str());
         }
