@@ -91,10 +91,13 @@ and the decoder seam. Backends implement these; the engine orchestrates them.
 - **Phase 1 ✅** — restructure (`core`/`backends`/`tools`/`platform`/`scripts`),
   unified desktop build, `AudioSource`/`AudioSink` interfaces, and full-duplex
   ALSA/JACK (added the output sinks). Verified on real hardware + jackd2.
-- **Phase 2 (in progress)** — adopt the seam architecture above (this doc), then
-  port Android off Java: `ae::Engine` + C ABI, native decode (`AMediaCodec`),
-  native output (AAudio), native DSD, retiring `AudioEngine.java`. The
-  minSdk 24→26 (AAudio) vs OpenSL ES decision is settled in the Phase 2 design.
+- **Phase 2 ✅** — Android ported off Java. `ae::Engine` (`core/`) behind the C
+  ABI (`api/`); native decode (`AMediaCodec`), output/capture (AAudio), USB DAC
+  sink with volume policy, gapless + seek, and native DSD (DFF/DSF parsers + DoP
+  packer). minSdk 26 (AAudio-only). The engine now ships **zero `.java`**; the
+  five legacy `*_jni.cpp` bridges and all `src/main/java/**` are deleted. Host
+  apps talk only to `audio_engine.h` (ABI v3). Compile-verified across all four
+  Android ABIs + desktop; on-device audio testing pending real hardware.
 - **Phase 3 (parked)** — Windows WASAPI backend behind the same interfaces.
 
 ## Conventions
