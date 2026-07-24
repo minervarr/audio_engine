@@ -1,3 +1,6 @@
 [submodule "src/main/cpp/libusb"]
 	path = third_party/libusb
 	url = https://github.com/libusb/libusb.git
+[submodule "third_party/flac"]
+	path = third_party/flac
+	url = https://github.com/xiph/flac.git

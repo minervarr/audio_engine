@@ -16,6 +16,33 @@ set(AE_THIRD_PARTY ${AE_ROOT}/third_party)
 include(${AE_ROOT}/cmake/ae_libusb.cmake)
 ae_add_libusb(usb1)
 
+# libmpg123 (LGPL-2.1) native MP3 decoder + LAME/libmp3lame (LGPL) MP3 encoder.
+# Both are autotools libs with no CMake, built via our helpers against a
+# build-generated config.h kept outside the pristine third_party trees (same
+# pattern as ae_libusb). Native MP3 = identical on every OEM, unlike AMediaCodec.
+include(${AE_ROOT}/cmake/ae_mpg123.cmake)
+ae_add_mpg123(mpg123)
+include(${AE_ROOT}/cmake/ae_lame.cmake)
+ae_add_lame(mp3lame)
+
+# libFLAC static lib (BSD-3-Clause; decoder + encoder) for native FLAC playback
+# and recording — identical on every OEM, unlike AMediaCodec. Build ONLY the
+# library: no CLI tools (those are GPL), no C++ wrapper/tests/docs, no Ogg.
+# We ship 64-bit ABIs only (see build.gradle abiFilters), so libFLAC's 32-bit
+# Android fseeko/ftello quirk never applies.
+set(BUILD_CXXLIBS             OFF CACHE BOOL "" FORCE)
+set(BUILD_PROGRAMS            OFF CACHE BOOL "" FORCE)
+set(BUILD_EXAMPLES            OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING             OFF CACHE BOOL "" FORCE)
+set(BUILD_DOCS                OFF CACHE BOOL "" FORCE)
+set(WITH_OGG                  OFF CACHE BOOL "" FORCE)
+set(WITH_STACK_PROTECTOR      OFF CACHE BOOL "" FORCE)
+set(INSTALL_MANPAGES          OFF CACHE BOOL "" FORCE)
+set(INSTALL_PKGCONFIG_MODULES OFF CACHE BOOL "" FORCE)
+set(INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS         OFF CACHE BOOL "" FORCE)
+add_subdirectory(${AE_THIRD_PARTY}/flac ${CMAKE_BINARY_DIR}/flac_build)
+
 # Main shared library: 100% C++ (zero .java, per architectural directive 5).
 # The pure-C++ engine (ae::Engine) + the C ABI wrapper + the native Android
 # backends (AMediaCodec decode, AAudio output/capture, USB DAC, DSD). Every host
@@ -23,6 +50,7 @@ ae_add_libusb(usb1)
 add_library(${CMAKE_PROJECT_NAME} SHARED
     # engine core + C ABI
     ${AE_CORE}/src/engine.cpp
+    ${AE_CORE}/src/recorder.cpp
     ${AE_API}/src/audio_engine.cpp
     # native Android backends (decode + output + capture)
     ${AE_BACKENDS}/mediacodec/mediacodec_decoder.cpp
@@ -34,7 +62,13 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
     # DSD backend (parsers + DoP packer; pure C++/POSIX, all platforms)
     ${AE_BACKENDS}/dsd/dff_parser.cpp
     ${AE_BACKENDS}/dsd/dsf_parser.cpp
-    ${AE_BACKENDS}/dsd/dsd_decoder.cpp)
+    ${AE_BACKENDS}/dsd/dsd_decoder.cpp
+    # FLAC backend (native decode + encode via vendored libFLAC)
+    ${AE_BACKENDS}/flac/flac_decoder.cpp
+    ${AE_BACKENDS}/flac/flac_encoder.cpp
+    # MP3 backend (native decode via libmpg123 + encode via LAME)
+    ${AE_BACKENDS}/mp3/mp3_decoder.cpp
+    ${AE_BACKENDS}/mp3/mp3_encoder.cpp)
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${AE_CORE}/include
@@ -43,8 +77,11 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${AE_BACKENDS}/mediacodec
     ${AE_BACKENDS}/aaudio
     ${AE_BACKENDS}/dsd
+    ${AE_BACKENDS}/flac
+    ${AE_BACKENDS}/mp3
     ${AE_THIRD_PARTY}
     ${AE_THIRD_PARTY}/libusb/libusb
+    ${AE_THIRD_PARTY}/flac/include
     ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
@@ -54,6 +91,9 @@ target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
 # aaudio: AAudio output/capture. mediandk: AMediaCodec/AMediaExtractor decode.
 target_link_libraries(${CMAKE_PROJECT_NAME}
     usb1
+    FLAC
+    mpg123
+    mp3lame
     aaudio
     mediandk
     android

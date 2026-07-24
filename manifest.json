@@ -5,5 +5,11 @@
   "license": "UNLICENSED",
   "platforms": ["linux", "android", "windows"],
   "language": "C++17",
-  "public_api": "api/include/audio_engine.h"
+  "public_api": "api/include/audio_engine.h",
+  "third_party": [
+    { "name": "libusb", "path": "third_party/libusb", "license": "LGPL-2.1", "use": "direct USB (UAC1/UAC2) device IO" },
+    { "name": "libFLAC", "path": "third_party/flac", "license": "BSD-3-Clause", "use": "native FLAC decode (playback) + encode (recording); library only, not the GPL CLI tools" },
+    { "name": "libmpg123", "path": "third_party/mpg123", "license": "LGPL-2.1", "use": "native MP3 decode (playback); libmpg123 only, generic build, not the mpg123 CLI", "fetch": "initialize_files.py (mpg123 1.32.10, not committed)" },
+    { "name": "LAME", "path": "third_party/lame", "license": "LGPL-2.0-or-later", "use": "native MP3 encode (recording); libmp3lame only, not the GPL lame CLI", "fetch": "initialize_files.py (LAME 3.100, not committed)" }
+  ]
 }

@@ -1,3 +1,8 @@
 .claude/
 .cxx/
 build/
+
+# Download-vendored MP3 libraries — fetched by initialize_files.py, not committed.
+# (Their generated config.h in third_party/*-config/ IS committed.)
+/third_party/mpg123/
+/third_party/lame/
