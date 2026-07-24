@@ -197,6 +197,31 @@ ae_result ae_capture_start(ae_capture* capture);
 int ae_capture_read(ae_capture* capture, uint8_t* out, int max_bytes);
 ae_result ae_capture_stop(ae_capture* capture);
 
+/* --- recording (mic -> FLAC / MP3 file) ---------------------------------- */
+/*
+ * Record on-device audio (Android: AAudio microphone) straight to a file,
+ * encoded natively: FLAC via libFLAC (lossless) or MP3 via LAME (lossy VBR).
+ * The host owns the output-file `fd` and the RECORD_AUDIO runtime permission.
+ * Lifecycle: create -> start -> stop -> destroy. Capture + encode run on an
+ * internal thread; start/stop are non-blocking apart from stop() finalizing
+ * the file.
+ */
+typedef struct ae_recorder ae_recorder;
+
+/* Output codec chosen at recorder creation. */
+typedef enum {
+    AE_REC_FLAC = 0,   /* lossless, libFLAC */
+    AE_REC_MP3  = 1    /* lossy VBR (~V2), LAME */
+} ae_rec_codec;
+
+ae_recorder* ae_recorder_create(ae_rec_codec codec);
+void         ae_recorder_destroy(ae_recorder* recorder);
+
+/* Begin capturing to the chosen codec's stream on `fd` at the requested format
+ * (16-bit PCM in). */
+ae_result ae_recorder_start(ae_recorder* recorder, int fd, int sample_rate_hz, int channels);
+ae_result ae_recorder_stop(ae_recorder* recorder);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

@@ -1,13 +1,58 @@
 #include "audio_engine.h"
 
 #include <memory>
+#include <unistd.h>
 
 #include "core/engine.hpp"
+#include "core/recorder.hpp"
 #include "aaudio_sink.h"          // backends/aaudio
 #include "mediacodec_decoder.h"   // backends/mediacodec
+#include "flac_decoder.h"         // backends/flac
+#include "flac_encoder.h"         // backends/flac
+#include "mp3_decoder.h"          // backends/mp3
+#include "mp3_encoder.h"          // backends/mp3
 #include "usb_sink.h"             // backends/usb
 #include "dsd_decoder.h"          // backends/dsd
 #include "aaudio_source.h"        // backends/aaudio (capture)
+
+namespace {
+// Is this the start of an MP3 stream? Conservative on purpose so we never steal
+// ADTS-AAC (which shares the 0xFFF sync): accept an ID3v2 tag, or a raw MPEG
+// *Layer III* frame header (sync 0xFFEx, non-reserved version, layer bits == 01).
+bool sniff_mp3(const unsigned char* m, int n) {
+    if (n >= 3 && m[0] == 'I' && m[1] == 'D' && m[2] == '3') return true;   // ID3v2
+    if (n >= 2 && m[0] == 0xFF && (m[1] & 0xE0) == 0xE0) {
+        int version = (m[1] >> 3) & 0x03;   // 01 = reserved
+        int layer   = (m[1] >> 1) & 0x03;   // 01 = Layer III
+        if (version != 0x01 && layer == 0x01) return true;
+    }
+    return false;
+}
+
+// Pick a decoder by sniffing the stream: native FLAC ("fLaC") and native MP3 go
+// to our own libFLAC / libmpg123 decoders (identical on every OEM — FLAC is
+// bit-perfect, MP3 escapes the per-vendor codec lottery); everything else, and
+// any native-decoder open failure, falls back to the platform AMediaCodec.
+// Returns an opened decoder, or nullptr on failure.
+std::unique_ptr<ae::Decoder> make_decoder(int fd, int64_t offset, int64_t length) {
+    unsigned char magic[4] = {0};
+    int n = (int)::pread(fd, magic, 4, offset < 0 ? 0 : offset);
+
+    if (n == 4 && magic[0] == 'f' && magic[1] == 'L' && magic[2] == 'a' && magic[3] == 'C') {
+        std::unique_ptr<ae::FlacDecoder> d(new ae::FlacDecoder());
+        if (d->open(fd, offset, length)) return d;
+        return nullptr;   // it really is FLAC; don't mis-route to MediaCodec
+    }
+    if (sniff_mp3(magic, n)) {
+        std::unique_ptr<ae::Mp3Decoder> d(new ae::Mp3Decoder());
+        if (d->open(fd, offset, length)) return d;
+        // fall through: sniff can misfire on junk-prefixed streams -> let the OS try
+    }
+    std::unique_ptr<ae::MediaCodecDecoder> d(new ae::MediaCodecDecoder());
+    if (d->open(fd, offset, length)) return d;
+    return nullptr;
+}
+} // namespace
 
 // The opaque handle: an ae::Engine plus the C callback trampolines.
 struct ae_engine {
@@ -45,7 +90,7 @@ const char* ae_result_str(ae_result code) {
     return "unrecognized result code";
 }
 
-uint32_t ae_abi_version(void) { return 3; }
+uint32_t ae_abi_version(void) { return 5; }
 
 ae_engine* ae_engine_create(void) {
     std::unique_ptr<ae::AudioSink> sink(new ae::AAudioSink());
@@ -85,8 +130,8 @@ void ae_engine_set_transition_cb(ae_engine* engine, ae_transition_cb on_transiti
 
 ae_result ae_engine_play_fd(ae_engine* engine, int fd, int64_t offset, int64_t length) {
     if (!engine || !engine->engine || fd < 0) return AE_ERR_INVALID_ARG;
-    std::unique_ptr<ae::MediaCodecDecoder> dec(new ae::MediaCodecDecoder());
-    if (!dec->open(fd, offset, length)) return AE_ERR_DECODE;
+    auto dec = make_decoder(fd, offset, length);
+    if (!dec) return AE_ERR_DECODE;
     return engine->engine->play(std::move(dec)) ? AE_OK : AE_ERR_DEVICE;
 }
 
@@ -99,8 +144,8 @@ ae_result ae_engine_play_dsd_fd(ae_engine* engine, int fd, int64_t offset, int64
 
 ae_result ae_engine_enqueue_next_fd(ae_engine* engine, int fd, int64_t offset, int64_t length) {
     if (!engine || !engine->engine || fd < 0) return AE_ERR_INVALID_ARG;
-    std::unique_ptr<ae::MediaCodecDecoder> dec(new ae::MediaCodecDecoder());
-    if (!dec->open(fd, offset, length)) return AE_ERR_DECODE;
+    auto dec = make_decoder(fd, offset, length);
+    if (!dec) return AE_ERR_DECODE;
     engine->engine->enqueueNext(std::move(dec));
     return AE_OK;
 }
@@ -223,6 +268,48 @@ int ae_capture_read(ae_capture* capture, uint8_t* out, int max_bytes) {
 ae_result ae_capture_stop(ae_capture* capture) {
     if (!capture || !capture->source) return AE_ERR_INVALID_ARG;
     capture->source->stop();
+    return AE_OK;
+}
+
+// --- recording (mic -> FLAC / MP3 file) --------------------------------------
+
+struct ae_recorder {
+    std::unique_ptr<ae::Recorder> recorder;
+};
+
+ae_recorder* ae_recorder_create(ae_rec_codec codec) {
+    ae_recorder* h = new (std::nothrow) ae_recorder();
+    if (!h) return nullptr;
+    std::unique_ptr<ae::AudioSource> src(new ae::AAudioSource());
+    std::unique_ptr<ae::Encoder>     enc;
+    switch (codec) {
+        case AE_REC_MP3:  enc.reset(new ae::Mp3Encoder());  break;
+        case AE_REC_FLAC:
+        default:          enc.reset(new ae::FlacEncoder()); break;
+    }
+    h->recorder.reset(new ae::Recorder(std::move(src), std::move(enc)));
+    return h;
+}
+
+void ae_recorder_destroy(ae_recorder* recorder) {
+    if (!recorder) return;
+    if (recorder->recorder) recorder->recorder->stop();
+    delete recorder;
+}
+
+ae_result ae_recorder_start(ae_recorder* recorder, int fd, int sample_rate_hz, int channels) {
+    if (!recorder || !recorder->recorder || fd < 0) return AE_ERR_INVALID_ARG;
+    ae::AudioFormat fmt{};
+    fmt.sampleRate   = sample_rate_hz;
+    fmt.channels     = channels;
+    fmt.bitDepth     = 16;
+    fmt.subslotBytes = 2;
+    return recorder->recorder->start(fd, fmt) ? AE_OK : AE_ERR_DEVICE;
+}
+
+ae_result ae_recorder_stop(ae_recorder* recorder) {
+    if (!recorder || !recorder->recorder) return AE_ERR_INVALID_ARG;
+    recorder->recorder->stop();
     return AE_OK;
 }
 

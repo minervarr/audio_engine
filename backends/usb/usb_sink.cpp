@@ -60,24 +60,24 @@ int UsbAudioSink::write(const uint8_t* data, int len) {
     // bytes consumed, which is exactly what the engine's byte loop expects.
     if (srcFmt_.isDsd) return d_->write(data, len);
 
-    // The decoder feeds 16-bit interleaved PCM. Route through writeInt16 so the
-    // driver's software gain + subslot upscaling apply. writeInt16 returns the
-    // number of channel-samples consumed; the engine wants bytes.
-    const int sampleBytes = 2;
-    const int srcCh  = srcFmt_.channels;
-    const int wireCh = d_->getConfiguredChannels();
+    // Route by the decoder's native depth so the DAC stays bit-perfect. Each
+    // driver writer applies software gain + subslot upscaling and returns the
+    // number of channel-samples consumed; the engine wants bytes, so multiply by
+    // the source subslot. 16-bit FLAC/PCM is bit-perfect; 24-bit FLAC reaches a
+    // 24-bit DAC untouched via writeInt24Packed.
+    const int subslot = srcFmt_.subslotBytes > 0 ? srcFmt_.subslotBytes : 2;
+    const int srcCh   = srcFmt_.channels;
+    const int wireCh  = d_->getConfiguredChannels();
 
-    if (wireCh > srcCh && srcCh > 0) {
-        // DAC has no matching mono/low-channel alt: upmix to the wire count so
-        // the driver doesn't misframe consecutive samples as L/R pairs.
-        const int srcFrameBytes  = srcCh  * sampleBytes;
+    // Mono->wire upmix (16-bit path only; hi-res content is effectively stereo).
+    if (subslot == 2 && wireCh > srcCh && srcCh > 0) {
+        const int srcFrameBytes  = srcCh  * 2;
         const int frames         = len / srcFrameBytes;
         if (frames <= 0) return 0;
-        const int wireFrameBytes = wireCh * sampleBytes;
+        const int wireFrameBytes = wireCh * 2;
         const size_t outBytes    = (size_t)frames * wireFrameBytes;
         if (expand_.size() < outBytes) expand_.resize(outBytes);
-        expandChannels(data, frames * srcFrameBytes, expand_.data(),
-                       sampleBytes, srcCh, wireCh);
+        expandChannels(data, frames * srcFrameBytes, expand_.data(), 2, srcCh, wireCh);
         int wireSamples = d_->writeInt16(
             reinterpret_cast<const int16_t*>(expand_.data()), (int)(outBytes / 2));
         if (wireSamples <= 0) return wireSamples;
@@ -87,10 +87,14 @@ int UsbAudioSink::write(const uint8_t* data, int len) {
         return framesWritten * srcFrameBytes;
     }
 
-    int samples = len / sampleBytes;
-    int consumed = d_->writeInt16(reinterpret_cast<const int16_t*>(data), samples);
+    int consumed;   // channel-samples consumed
+    switch (subslot) {
+        case 3:  consumed = d_->writeInt24Packed(data, len); break;                 // numBytes
+        case 4:  consumed = d_->writeInt32(reinterpret_cast<const int32_t*>(data), len / 4); break;
+        default: consumed = d_->writeInt16(reinterpret_cast<const int16_t*>(data), len / 2); break;
+    }
     if (consumed < 0) return consumed;
-    return consumed * sampleBytes;
+    return consumed * subslot;
 }
 
 void UsbAudioSink::stop() { if (d_) d_->stop(); }
