@@ -184,7 +184,42 @@ bool UsbAudioDriver::open(uint16_t vid, uint16_t pid) {
 
     handle = libusb_open_device_with_vid_pid(ctx, vid, pid);
     if (!handle) {
-        LOGE("Device VID=%04X PID=%04X not found (check libusbK binding via Zadig)", vid, pid);
+        // libusb collapses "no such device" and "device is right there but I
+        // could not open it" into the same NULL. Those need completely
+        // different fixes — plug the DAC in, versus grant access to it — so
+        // find out which one it was before saying anything about it.
+        libusb_device** list = nullptr;
+        const ssize_t   cnt  = libusb_get_device_list(ctx, &list);
+        bool present  = false;
+        int  openErr  = 0;
+        for (ssize_t i = 0; i < cnt; i++) {
+            libusb_device_descriptor desc{};
+            if (libusb_get_device_descriptor(list[i], &desc) < 0) continue;
+            if (desc.idVendor != vid || desc.idProduct != pid) continue;
+            present = true;
+            libusb_device_handle* probe = nullptr;
+            openErr = libusb_open(list[i], &probe);
+            if (openErr == 0 && probe) libusb_close(probe);  // raced; transient
+            break;
+        }
+        if (cnt >= 0) libusb_free_device_list(list, 1);
+
+        if (!present) {
+            LOGE("Device VID=%04X PID=%04X is not connected", vid, pid);
+        } else if (openErr == LIBUSB_ERROR_ACCESS) {
+#ifdef _WIN32
+            LOGE("Device VID=%04X PID=%04X found but access was denied — bind "
+                 "interface 0 to libusbK with Zadig", vid, pid);
+#else
+            LOGE("Device VID=%04X PID=%04X found but access was denied — your "
+                 "user needs read/write on its /dev/bus/usb node. Install a udev "
+                 "rule for this VID/PID (TAG+=\"uaccess\", or MODE/GROUP), then "
+                 "replug the device", vid, pid);
+#endif
+        } else {
+            LOGE("Device VID=%04X PID=%04X found but could not be opened: %s",
+                 vid, pid, libusb_error_name(openErr));
+        }
         libusb_exit(ctx);
         ctx = nullptr;
         return false;
