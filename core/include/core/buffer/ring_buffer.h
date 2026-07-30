@@ -31,7 +31,7 @@ public:
     size_t write(const uint8_t* data, size_t len) {
         size_t r = readPos.load(std::memory_order_acquire);
         size_t w = writePos.load(std::memory_order_relaxed);
-        size_t available = (r + capacity - w - 1) % capacity;
+        size_t available = freeSpace(r, w);
         size_t toWrite = std::min(len, available);
 
         size_t firstPart = std::min(toWrite, capacity - w);
@@ -40,14 +40,14 @@ public:
             memcpy(buffer, data + firstPart, toWrite - firstPart);
         }
 
-        writePos.store((w + toWrite) % capacity, std::memory_order_release);
+        writePos.store(advance(w, toWrite), std::memory_order_release);
         return toWrite;
     }
 
     size_t read(uint8_t* data, size_t len) {
         size_t w = writePos.load(std::memory_order_acquire);
         size_t r = readPos.load(std::memory_order_relaxed);
-        size_t available = (w + capacity - r) % capacity;
+        size_t available = distance(w, r);
         size_t toRead = std::min(len, available);
 
         size_t firstPart = std::min(toRead, capacity - r);
@@ -56,21 +56,21 @@ public:
             memcpy(data + firstPart, buffer, toRead - firstPart);
         }
 
-        readPos.store((r + toRead) % capacity, std::memory_order_release);
+        readPos.store(advance(r, toRead), std::memory_order_release);
         return toRead;
     }
 
     size_t getAvailable() const {
         size_t w = writePos.load(std::memory_order_acquire);
         size_t r = readPos.load(std::memory_order_acquire);
-        return (w + capacity - r) % capacity;
+        return distance(w, r);
     }
 
     // Returns a conservative lower bound on free space (reader may free more at any time).
     size_t getFreeSpace() const {
         size_t r = readPos.load(std::memory_order_acquire);
         size_t w = writePos.load(std::memory_order_relaxed);
-        return (r + capacity - w - 1) % capacity;
+        return freeSpace(r, w);
     }
 
     void clear() {
@@ -82,6 +82,40 @@ public:
     size_t getCapacity() const { return capacity; }
 
 private:
+    // Wrap by conditional subtraction rather than `%`. The modulo form needed a
+    // hardware integer divide on every call — capacity is a runtime value, so
+    // the compiler cannot strength-reduce it — and submitTransfer() reads this
+    // ring once per isochronous packet (32 per transfer) on the thread whose
+    // timing decides whether audio crackles.
+    //
+    // All three helpers are exact, not approximations, because readPos and
+    // writePos are always < capacity and no caller ever moves a position by
+    // more than capacity - 1:
+    //   advance()  — pos + delta < 2 * capacity, so one subtraction suffices.
+    //   distance() — the unwrapped difference needs at most one carry.
+    //   freeSpace()— reserves one byte to tell full from empty, which is why
+    //                it cannot be expressed as distance(readPos, writePos + 1):
+    //                writePos + 1 can equal capacity, and the comparison then
+    //                takes the wrong branch.
+    //
+    // A power-of-two capacity + mask was considered and rejected: it would
+    // round the mlock'd ring up by as much as 2x (18 MB -> 33 MB for a 3 s
+    // buffer at 768 kHz), and dsp_bench shows the wrap arithmetic is not where
+    // the time goes.
+    inline size_t advance(size_t pos, size_t delta) const {
+        const size_t next = pos + delta;
+        return next >= capacity ? next - capacity : next;
+    }
+    // Occupancy: bytes from readPos forward to writePos.
+    inline size_t distance(size_t ahead, size_t behind) const {
+        return ahead >= behind ? ahead - behind : ahead + capacity - behind;
+    }
+    // (r + capacity - w - 1) mod capacity, branch form. r == w (empty) must
+    // yield capacity - 1, which is why the `r > w` test is strict.
+    inline size_t freeSpace(size_t r, size_t w) const {
+        return r > w ? r - w - 1 : r + capacity - w - 1;
+    }
+
     const size_t capacity;
     uint8_t* const buffer;
     std::atomic<size_t> readPos;

@@ -188,10 +188,25 @@ int JackSink::process(uint32_t nframes) {
                      ? ring->read((uint8_t*)tmp, wanted) : 0;
     size_t gotFrames = got / ((size_t)ch * sizeof(float));
 
-    for (int c = 0; c < ch; ++c) {
-        float* pb = (float*)jack_port_get_buffer(outputPorts[c], nframes);
-        for (uint32_t f = 0; f < nframes; ++f) {
-            pb[f] = (f < gotFrames) ? tmp[f * ch + c] : 0.0f;   // zero-fill on underrun
+    // Deinterleave into JACK's per-port buffers. The `f < gotFrames` test used
+    // to sit inside the per-sample loop; splitting it into a copy run and a
+    // zero-fill tail drops a branch per sample on the RT thread and lets both
+    // halves vectorise. Stereo gets its own pass so the interleaved read is
+    // sequential rather than strided — it is the case that actually happens.
+    if (ch == 2) {
+        float* l = (float*)jack_port_get_buffer(outputPorts[0], nframes);
+        float* r = (float*)jack_port_get_buffer(outputPorts[1], nframes);
+        for (size_t f = 0; f < gotFrames; ++f) {
+            l[f] = tmp[f * 2];
+            r[f] = tmp[f * 2 + 1];
+        }
+        for (size_t f = gotFrames; f < nframes; ++f) { l[f] = 0.0f; r[f] = 0.0f; }
+    } else {
+        for (int c = 0; c < ch; ++c) {
+            float* pb = (float*)jack_port_get_buffer(outputPorts[c], nframes);
+            const float* src = tmp + c;
+            for (size_t f = 0; f < gotFrames; ++f) pb[f] = src[f * ch];
+            for (size_t f = gotFrames; f < nframes; ++f) pb[f] = 0.0f;  // underrun
         }
     }
     // Only a real underrun once we are connected — the deliberate silence

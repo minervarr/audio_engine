@@ -29,6 +29,21 @@ scripts/windows/build.ps1              # desktop Windows (parked) -> build/windo
 platform/android/gradlew assembleRelease   # Android AAR -> build via Gradle
 ```
 
+**DSP tests (`tests/`, Debug-only, run directly — no ctest, no framework):**
+
+```
+dsp_null_test    # bit-exactness gate — MUST pass before any DSP change lands
+dsp_bench        # ns/sample for the same paths
+```
+
+`dsp_null_test` holds frozen copies of every DSP path as it stood before the
+optimization work and asserts the live code still produces **identical** output
+— not close, identical. It covers `EqProcessor` (all encodings, 1–8 channels,
+1–10 filters), the USB wire packing, `ae::TpdfQuantizer`, `RingBuffer`'s
+wraparound contract, and validates the inline rounding in `core/dsp/round.h`
+against glibc over every IEEE tie plus 10M random doubles. Convention matches
+`core/tests/*.cc` in vk_canvas: plain `assert()`, `#undef NDEBUG`, no framework.
+
 **First-time setup:** run `git submodule update --init` (libusb, libFLAC) and
 `python3 initialize_files.py` (downloads mpg123 + LAME — their source is *not*
 committed; see `third_party/README.md`). The Android build hard-errors with the
@@ -95,6 +110,19 @@ and the decoder seam. Backends implement these; the engine orchestrates them.
    jack2's `libjack.so.0` and never mention pipewire.
 8. **Manifest rule.** Folder names describe *architecture*; project metadata
    lives in root `manifest.json`, never encoded in folder names.
+9. **DSP is bit-reproducible across platforms, and optimizations prove it.**
+   Two standing rules in `core/dsp/`:
+   - **No fused multiply-add on the signal path.** FMA is marginally more
+     accurate but makes ARM and x86 disagree with each other and with the
+     scalar reference. For an engine whose premise is identical bit-perfect
+     playback everywhere, reproducibility wins. The NEON biquad used
+     `vfmaq_f64` and did diverge; it no longer does.
+   - **Never `-ffast-math`.** It licenses reassociation and flush-to-zero and
+     would void the whole contract. `-fno-math-errno` is fine and is what the
+     consuming app sets — it changes no result, only errno bookkeeping.
+
+   Speed is bought from overhead (libm calls, redundant branches, byte-at-a-time
+   stores), never from the signal. `tests/dsp_null_test.cpp` is the arbiter.
 
 ## Phasing
 

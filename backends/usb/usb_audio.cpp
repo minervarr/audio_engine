@@ -1,4 +1,6 @@
 #include "usb_audio.h"
+#include "usb_pack.h"
+#include "core/dsp/round.h"
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -26,7 +28,17 @@ static inline void file_log(const char* level, const char* fmt, ...) {
 
 #define LOGI(...) file_log("INFO", __VA_ARGS__)
 #define LOGE(...) file_log("ERR", __VA_ARGS__)
+// LOGD is compiled out unless USB_AUDIO_VERBOSE, exactly as on POSIX below.
+// It used to call file_log unconditionally — a global mutex plus
+// fopen/fprintf/fclose — and handleTransferComplete() logs on EVERY
+// isochronous completion (~250/s at the default 64x32 queue, far more at high
+// rates). Doing filesystem IO on the thread whose timing decides whether audio
+// crackles is the one thing this driver must never do.
+#ifdef USB_AUDIO_VERBOSE
 #define LOGD(...) file_log("DEBUG", __VA_ARGS__)
+#else
+#define LOGD(...) do { } while (0)
+#endif
 static inline int mlock(const void* addr, size_t len) {
     return VirtualLock((LPVOID)addr, len) ? 0 : -1;
 }
@@ -1170,18 +1182,23 @@ bool UsbAudioDriver::configure(int sampleRate, int channels, int bitDepth, bool 
 // --- Transfer callbacks ---
 
 void UsbAudioDriver::transferCallback(struct libusb_transfer* transfer) {
-    auto* driver = static_cast<UsbAudioDriver*>(transfer->user_data);
-    driver->handleTransferComplete(transfer);
+    auto* ctx = static_cast<XferCtx*>(transfer->user_data);
+    ctx->drv->handleTransferComplete(transfer, ctx->index);
 }
 
-void UsbAudioDriver::handleTransferComplete(struct libusb_transfer* transfer) {
-    LOGD("transferCb: status=%d streaming=%d active=%d",
-         transfer->status, streaming.load() ? 1 : 0, activeTransfers.load());
-
+void UsbAudioDriver::handleTransferComplete(struct libusb_transfer* transfer, int index) {
     // This transfer just left the in-flight pool. Track the running minimum so
-    // the log reveals whether the queue ever drains toward empty.
+    // the log can reveal whether the queue ever drains toward empty.
+    //
+    // Verbose-only: the millis_now() below is a clock_gettime on every
+    // completion, and the whole block is a diagnostic for a bug that has since
+    // been characterised (see the queue-geometry note in usb_audio.h). The
+    // decrement itself is kept unconditionally because transfersInFlight is
+    // read elsewhere.
+    transfersInFlight.fetch_sub(1, std::memory_order_relaxed);
+#ifdef USB_AUDIO_VERBOSE
     {
-        int now_inflight = transfersInFlight.fetch_sub(1, std::memory_order_relaxed) - 1;
+        int now_inflight = transfersInFlight.load(std::memory_order_relaxed);
         if (now_inflight < minInFlight) minInFlight = now_inflight;
         uint32_t t = millis_now();
         if ((t - lastInFlightLogMs) >= 1000) {
@@ -1191,6 +1208,7 @@ void UsbAudioDriver::handleTransferComplete(struct libusb_transfer* transfer) {
             lastInFlightLogMs = t;
         }
     }
+#endif
 
     if (!streaming.load()) {
         activeTransfers--;
@@ -1220,12 +1238,11 @@ void UsbAudioDriver::handleTransferComplete(struct libusb_transfer* transfer) {
         return;
     }
 
-    // Find which transfer index this is
-    int idx = -1;
-    for (int i = 0; i < numTransfers; i++) {
-        if (transfers[i] == transfer) { idx = i; break; }
-    }
-    if (idx < 0) {
+    // The index arrives with the callback (see XferCtx in usb_audio.h) rather
+    // than being recovered by scanning the transfers[] array for a pointer
+    // match, which was O(numTransfers) — up to 64 comparisons — on every
+    // completion.
+    if (index < 0 || index >= numTransfers || transfers[index] != transfer) {
         int remaining = --activeTransfers;
         if (remaining <= 0) {
             LOGE("All transfers lost -- stopping streaming");
@@ -1236,9 +1253,9 @@ void UsbAudioDriver::handleTransferComplete(struct libusb_transfer* transfer) {
 
     // This transfer's real audio has now reached the DAC: move it from
     // "in flight" to "played" before the slot is refilled by submitTransfer.
-    framesPlayed_.fetch_add((uint64_t)transferRealFrames_[idx], std::memory_order_relaxed);
+    framesPlayed_.fetch_add((uint64_t)transferRealFrames_[index], std::memory_order_relaxed);
 
-    submitTransfer(idx);
+    submitTransfer(index);
 }
 
 void UsbAudioDriver::submitTransfer(int index) {
@@ -1633,11 +1650,13 @@ bool UsbAudioDriver::start() {
 #endif
         }
 
+        transferCtx[i].drv = this;
+        transferCtx[i].index = i;
         libusb_fill_iso_transfer(transfers[i], handle,
             activeFormat.endpointAddr,
             transferBuffers[i], nominalBufSize,
             packetsPerTransfer,
-            transferCallback, this, 1000);
+            transferCallback, &transferCtx[i], 1000);
 
         libusb_set_iso_packet_lengths(transfers[i], bytesPerPacket);
     }
@@ -1855,6 +1874,18 @@ int UsbAudioDriver::writeFloat32(const float* data, int numSamples) {
 
         int outBytes = 0;
 
+        // Everything the old per-sample `switch (configuredBitDepth)` decided
+        // is fixed for the whole call, so decide it once. Dither is applied at
+        // 16-bit only: there the truncation error needs decorrelating into a
+        // flat noise floor, while at 24/32-bit the quantization error already
+        // sits below any DAC's noise floor and dither would only waste
+        // headroom.
+        const double quantScale = (configuredBitDepth == 24) ? 8388607.0
+                                : (configuredBitDepth == 32) ? 2147483647.0
+                                :                              32767.0;
+        const bool ditherAndClamp16 =
+            (configuredBitDepth != 24 && configuredBitDepth != 32);
+
         const float gain = softwareGain.load(std::memory_order_relaxed);
         for (int i = 0; i < batch; i++) {
             double sd = WRITE_CONST_DATA
@@ -1869,28 +1900,23 @@ int UsbAudioDriver::writeFloat32(const float* data, int numSamples) {
             }
 
             // Quantize with rounding (a bare cast truncates toward zero, which
-            // adds correlated distortion). At 16-bit also add TPDF dither so
-            // the truncation error decorrelates into a flat noise floor; at
-            // 24/32-bit the quantization error sits below any DAC's noise
-            // floor and dither would only waste headroom.
+            // adds correlated distortion). ae::roundHalfEven is lrint's exact
+            // semantics as a single instruction — lrint itself is a libm call,
+            // which this loop was making once per sample.
             int32_t v;
-            switch (configuredBitDepth) {
-                case 24: v = (int32_t)lrint(sd * 8388607.0);    break;
-                case 32: v = (int32_t)lrint(sd * 2147483647.0); break;
-                case 16:
-                default: {
-                    double scaled = sd * 32767.0 + ditherRng_.nextTPDF();
-                    int32_t q = (int32_t)lrint(scaled);
-                    if (q > 32767) q = 32767;
-                    else if (q < -32768) q = -32768;
-                    v = q;
-                    break;
-                }
+            if (ditherAndClamp16) {
+                const double scaled = sd * quantScale + ditherRng_.nextTPDF();
+                int32_t q = (int32_t)ae::roundHalfEven(scaled);
+                if (q > 32767) q = 32767;
+                else if (q < -32768) q = -32768;
+                v = q;
+            } else {
+                v = (int32_t)ae::roundHalfEven(sd * quantScale);
             }
-            int32_t wire = v << padBits;
-            for (int b = 0; b < subslotBytes; b++) {
-                convBuf[outBytes++] = (wire >> (b * 8)) & 0xFF;
-            }
+            const int32_t wire =
+                (int32_t)((uint32_t)v << padBits);   // unsigned: no signed-shift UB
+            ae::usbpack::storeLEDyn(convBuf + outBytes, wire, subslotBytes);
+            outBytes += subslotBytes;
         }
 
         int written = (int)ringBuffer->write(convBuf, outBytes);
@@ -1911,14 +1937,12 @@ int UsbAudioDriver::writeInt16(const int16_t* data, int numSamples) {
     // MSBs survive in the output and only the LSBs are truncated. (Previously
     // the code clamped to 0 here and emitted the LSB byte, which destroyed
     // the signal entirely.)
-    int subslotBytes = configuredSubslotSize;
-    int dataShift = (subslotBytes * 8) - 16;
+    const int subslotBytes = configuredSubslotSize;
+    const int bytesPerFrame = subslotBytes * configuredChannels;
 
     const int CHUNK = 512;
     uint8_t convBuf[CHUNK * 4]; // max 4 bytes per sample
     int totalConsumed = 0;
-
-    int bytesPerFrame = subslotBytes * configuredChannels;
 
     while (totalConsumed < numSamples) {
         size_t space = ringBuffer->getFreeSpace();
@@ -1928,26 +1952,9 @@ int UsbAudioDriver::writeInt16(const int16_t* data, int numSamples) {
         if (maxSamples <= 0) break;
         int batch = std::min({CHUNK, numSamples - totalConsumed, maxSamples});
 
-        int outBytes = 0;
-
         const float gain = softwareGain.load(std::memory_order_relaxed);
-        for (int i = 0; i < batch; i++) {
-            int16_t s = data[totalConsumed + i];
-            int32_t scaled;
-            if (gain >= 0.9999f) {
-                scaled = (int32_t)s;
-            } else {
-                float fs = (float)s * gain;
-                if (fs > 32767.0f) fs = 32767.0f;
-                else if (fs < -32768.0f) fs = -32768.0f;
-                scaled = (int32_t)fs;
-            }
-            int32_t wire = (dataShift >= 0) ? (scaled << dataShift)
-                                            : (scaled >> -dataShift);
-            for (int b = 0; b < subslotBytes; b++) {
-                convBuf[outBytes++] = (wire >> (b * 8)) & 0xFF;
-            }
-        }
+        const int outBytes = ae::usbpack::packInt16Dyn(
+            data + totalConsumed, batch, convBuf, subslotBytes, gain);
 
         int written = (int)ringBuffer->write(convBuf, outBytes);
         int samplesWritten = written / subslotBytes;
@@ -1965,15 +1972,30 @@ int UsbAudioDriver::writeInt24Packed(const uint8_t* data, int numBytes) {
     int numSamples = numBytes / 3;
     if (numSamples <= 0) return 0;
 
-    int subslotBytes = configuredSubslotSize;
-    int padBits = subslotBytes * 8 - configuredBitDepth;
-    if (padBits < 0) padBits = 0;
+    // usbpack left-aligns the 24-bit value inside the DAC subslot when the
+    // subslot is wide enough, and otherwise drops LSBs so the signal's MSBs
+    // reach the DAC (e.g. 24-bit source -> 16-bit DAC). Clamping the shift to 0
+    // would emit the LSB bytes and silently destroy the signal, producing the
+    // "noise that scales with input level" symptom of LSB-only playback.
+    const int subslotBytes = configuredSubslotSize;
+    const int bytesPerFrame = subslotBytes * configuredChannels;
+    const float gain = softwareGain.load(std::memory_order_relaxed);
+
+    // Bit-perfect fast path, same reasoning as writeInt32: a 3-byte subslot at
+    // unity gain reproduces the caller's packed-24 bytes exactly.
+    if (subslotBytes == 3 && gain >= ae::usbpack::kUnityGain) {
+        const size_t space = ringBuffer->getFreeSpace();
+        int alignedBytes = bytesPerFrame > 0
+            ? (int)(space / bytesPerFrame) * bytesPerFrame : (int)space;
+        const int toWrite = std::min(numSamples * 3, alignedBytes);
+        if (toWrite <= 0) return 0;
+        const int written = (int)ringBuffer->write(data, (size_t)toWrite);
+        return written / 3;
+    }
 
     const int CHUNK = 512;
     uint8_t convBuf[CHUNK * 4];
     int totalConsumed = 0;
-
-    int bytesPerFrame = subslotBytes * configuredChannels;
 
     while (totalConsumed < numSamples) {
         size_t space = ringBuffer->getFreeSpace();
@@ -1983,36 +2005,8 @@ int UsbAudioDriver::writeInt24Packed(const uint8_t* data, int numBytes) {
         if (maxSamples <= 0) break;
         int batch = std::min({CHUNK, numSamples - totalConsumed, maxSamples});
 
-        const float gain = softwareGain.load(std::memory_order_relaxed);
-        int outBytes = 0;
-        for (int i = 0; i < batch; i++) {
-            int off = (totalConsumed + i) * 3;
-            // Sign-extend 24-bit LE to int32: load 3 bytes into bits 8..31 then arithmetic shift down.
-            int32_t v = ((int32_t)data[off] << 8)
-                      | ((int32_t)data[off + 1] << 16)
-                      | ((int32_t)data[off + 2] << 24);
-            v >>= 8;  // arithmetic shift, preserves sign
-
-            if (gain < 0.9999f) {
-                float fs = (float)v * gain;
-                if (fs > 8388607.0f) fs = 8388607.0f;
-                else if (fs < -8388608.0f) fs = -8388608.0f;
-                v = (int32_t)fs;
-            }
-
-            // The value is 24-bit; left-align inside the DAC subslot when the
-            // subslot is wide enough, otherwise drop LSBs so the signal MSBs
-            // reach the DAC (e.g. 24-bit source -> 16-bit DAC). Clamping to 0
-            // here would emit the LSB bytes of v and silently destroy the
-            // signal, producing the "noise that scales with input level"
-            // symptom characteristic of LSB-only playback.
-            int dataShift = (subslotBytes * 8) - 24;
-            int32_t wire = (dataShift >= 0) ? (v << dataShift)
-                                            : (v >> -dataShift);
-            for (int b = 0; b < subslotBytes; b++) {
-                convBuf[outBytes++] = (wire >> (b * 8)) & 0xFF;
-            }
-        }
+        const int outBytes = ae::usbpack::packInt24Dyn(
+            data + (size_t)totalConsumed * 3, batch, convBuf, subslotBytes, gain);
 
         int written = (int)ringBuffer->write(convBuf, outBytes);
         int samplesWritten = written / subslotBytes;
@@ -2026,18 +2020,34 @@ int UsbAudioDriver::writeInt32(const int32_t* data, int numSamples) {
     if (!ringBuffer) return -1;
     if (numSamples <= 0) return 0;
 
-    int subslotBytes = configuredSubslotSize;
-    // 32-bit data is already full-range; no left-align padding needed for 32-bit DAC.
-    // For narrower DAC subslots (24-bit, 16-bit, etc.) we truncate LSBs so the
-    // signal's MSBs survive in the output. Clamping to 0 here would emit the
-    // LSB bytes of the source and lose the signal entirely.
-    int dataShift = (subslotBytes * 8) - 32;
+    // 32-bit data is already full-range; no left-align padding needed for a
+    // 32-bit DAC. For narrower DAC subslots (24-bit, 16-bit, ...) usbpack
+    // truncates LSBs so the signal's MSBs survive in the output. Clamping to 0
+    // would emit the LSB bytes of the source and lose the signal entirely.
+    const int subslotBytes = configuredSubslotSize;
+    const int bytesPerFrame = subslotBytes * configuredChannels;
+    const float gain = softwareGain.load(std::memory_order_relaxed);
+
+    // ── Bit-perfect fast path ────────────────────────────────────────────
+    // A 4-byte subslot at unity gain means the wire format IS the caller's
+    // buffer: shift is zero, gain is identity, and the bytes are already
+    // little-endian int32. Staging that through a 2 KB scratch buffer one
+    // shift-and-mask at a time was pure ceremony. dsp_null_test asserts the
+    // byte-for-byte equivalence that licenses this.
+    if (subslotBytes == 4 && gain >= ae::usbpack::kUnityGain) {
+        const size_t space = ringBuffer->getFreeSpace();
+        int alignedBytes = bytesPerFrame > 0
+            ? (int)(space / bytesPerFrame) * bytesPerFrame : (int)space;
+        const int toWrite = std::min(numSamples * 4, alignedBytes);
+        if (toWrite <= 0) return 0;
+        const int written = (int)ringBuffer->write(
+            reinterpret_cast<const uint8_t*>(data), (size_t)toWrite);
+        return written / 4;
+    }
 
     const int CHUNK = 512;
     uint8_t convBuf[CHUNK * 4];
     int totalConsumed = 0;
-
-    int bytesPerFrame = subslotBytes * configuredChannels;
 
     while (totalConsumed < numSamples) {
         size_t space = ringBuffer->getFreeSpace();
@@ -2047,23 +2057,8 @@ int UsbAudioDriver::writeInt32(const int32_t* data, int numSamples) {
         if (maxSamples <= 0) break;
         int batch = std::min({CHUNK, numSamples - totalConsumed, maxSamples});
 
-        const float gain = softwareGain.load(std::memory_order_relaxed);
-        int outBytes = 0;
-        for (int i = 0; i < batch; i++) {
-            int32_t v = data[totalConsumed + i];
-            if (gain < 0.9999f) {
-                // float has 24-bit mantissa -- enough for typical attenuation work.
-                float fs = (float)v * gain;
-                if (fs > 2147483520.0f) fs = 2147483520.0f;
-                else if (fs < -2147483648.0f) fs = -2147483648.0f;
-                v = (int32_t)fs;
-            }
-            int32_t wire = (dataShift >= 0) ? (v << dataShift)
-                                            : (v >> -dataShift);
-            for (int b = 0; b < subslotBytes; b++) {
-                convBuf[outBytes++] = (wire >> (b * 8)) & 0xFF;
-            }
-        }
+        const int outBytes = ae::usbpack::packInt32Dyn(
+            data + totalConsumed, batch, convBuf, subslotBytes, gain);
 
         int written = (int)ringBuffer->write(convBuf, outBytes);
         int samplesWritten = written / subslotBytes;
@@ -2409,11 +2404,11 @@ bool UsbAudioDriver::configureCapture(int sampleRate, int channels, int bitDepth
 }
 
 void UsbAudioDriver::captureCallback(struct libusb_transfer* transfer) {
-    auto* driver = static_cast<UsbAudioDriver*>(transfer->user_data);
-    driver->handleCaptureComplete(transfer);
+    auto* ctx = static_cast<XferCtx*>(transfer->user_data);
+    ctx->drv->handleCaptureComplete(transfer, ctx->index);
 }
 
-void UsbAudioDriver::handleCaptureComplete(struct libusb_transfer* transfer) {
+void UsbAudioDriver::handleCaptureComplete(struct libusb_transfer* transfer, int index) {
     if (!capStreaming.load()) {
         capActiveTransfers--;
         return;
@@ -2498,11 +2493,8 @@ void UsbAudioDriver::handleCaptureComplete(struct libusb_transfer* transfer) {
         }
     }
 
-    int idx = -1;
-    for (int i = 0; i < capNumTransfers; i++) {
-        if (capTransfers[i] == transfer) { idx = i; break; }
-    }
-    if (idx < 0) {
+    // Index arrives with the callback (XferCtx), not via a scan of capTransfers.
+    if (index < 0 || index >= capNumTransfers || capTransfers[index] != transfer) {
         int remaining = --capActiveTransfers;
         if (remaining <= 0) {
             LOGE("All capture transfers lost -- stopping");
@@ -2511,7 +2503,7 @@ void UsbAudioDriver::handleCaptureComplete(struct libusb_transfer* transfer) {
         return;
     }
 
-    submitCaptureTransfer(idx);
+    submitCaptureTransfer(index);
 }
 
 void UsbAudioDriver::submitCaptureTransfer(int index) {
@@ -2677,11 +2669,13 @@ bool UsbAudioDriver::startCapture() {
             LOGD("mlock capture transfer[%d] failed: %s (non-fatal)", i, strerror(errno));
         }
 
+        capTransferCtx[i].drv = this;
+        capTransferCtx[i].index = i;
         libusb_fill_iso_transfer(capTransfers[i], handle,
             capActiveFormat.endpointAddr,
             capTransferBuffers[i], capTransferBufSize,
             capPacketsPerTransfer,
-            captureCallback, this, 1000);
+            captureCallback, &capTransferCtx[i], 1000);
         libusb_set_iso_packet_lengths(capTransfers[i], capEffectiveMaxPkt);
     }
 

@@ -45,7 +45,52 @@ target_include_directories(ae_usb PUBLIC
     ${AE_THIRD_PARTY}
     ${AE_THIRD_PARTY}/libusb/libusb)
 target_link_libraries(ae_usb PUBLIC ae_core usb1 Threads::Threads)
-target_compile_options(ae_usb PRIVATE -O3 -funroll-loops)
+# -O3 here is a GCC/Clang spelling. It used to be unguarded, so on Windows MSVC
+# rejected it (D9002 "ignoring unknown option") and the primary USB backend
+# silently built at whatever CMAKE_CXX_FLAGS_<CONFIG> gave it — the opposite of
+# what this line intends. /fp:precise is MSVC's default but stated explicitly:
+# the DSP downstream depends on IEEE semantics, and nothing here may be
+# reassociated.
+if(MSVC)
+    target_compile_options(ae_usb PRIVATE /O2 /fp:precise)
+else()
+    target_compile_options(ae_usb PRIVATE -O3 -funroll-loops)
+endif()
+
+# --- DSP tests + benchmark ----------------------------------------------------
+# Debug-only, and deliberately NOT inside the Linux block below: both are pure
+# C++17 over header-only core/ code, so they build and run on every desktop
+# platform. Convention matches framework/vk_canvas/core/tests/*.cc — plain
+# assert(), no test framework, `#undef NDEBUG` in the source so the asserts
+# survive optimization.
+#
+#   dsp_null_test — the bit-exactness gate. Holds a frozen copy of the DSP as
+#                   it stood before any optimization and asserts the live code
+#                   still produces identical output. Every optimization phase
+#                   must leave this passing.
+#   dsp_bench     — ns/sample for the same paths, so a change can be shown to
+#                   be worth making. Compiled -O3 even in a Debug build:
+#                   benchmarking unoptimized code measures nothing.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    # backends/usb is on the include path for usb_pack.h only — a header-only,
+    # libusb-free piece of the USB backend, which is why it can be tested
+    # without linking ae_usb or opening a device.
+    add_executable(dsp_null_test ${AE_ROOT}/tests/dsp_null_test.cpp)
+    target_link_libraries(dsp_null_test PRIVATE ae_core)
+    target_include_directories(dsp_null_test PRIVATE ${AE_BACKENDS}/usb)
+
+    add_executable(dsp_bench ${AE_ROOT}/tests/dsp_bench.cpp)
+    target_link_libraries(dsp_bench PRIVATE ae_core)
+    target_include_directories(dsp_bench PRIVATE ${AE_BACKENDS}/usb)
+
+    foreach(t dsp_null_test dsp_bench)
+        if(MSVC)
+            target_compile_options(${t} PRIVATE /O2 /fp:precise)
+        else()
+            target_compile_options(${t} PRIVATE -O3 -Wall)
+        endif()
+    endforeach()
+endif()
 
 # --- Linux-only backends + tools ----------------------------------------------
 if(UNIX AND NOT APPLE AND NOT ANDROID)

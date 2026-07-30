@@ -177,16 +177,27 @@ private:
     bool setSampleRateUAC2(int clockId, int rate);
     std::vector<int> queryUac2SampleRates(int clockId);
     bool queryHwVolumeRange();
+    // Per-transfer callback context. libusb hands `user_data` back on every
+    // completion, so carrying the queue slot in it turns the callback's
+    // "which transfer was that?" step from a linear scan over the whole queue
+    // (up to 64 pointer compares, on the isochronous event thread, for every
+    // completion) into a field read. One instance per slot, owned by the
+    // arrays below; they outlive every transfer that points at them.
+    struct XferCtx {
+        UsbAudioDriver* drv;
+        int index;
+    };
+
     void submitTransfer(int index);
     static void transferCallback(struct libusb_transfer* transfer);
-    void handleTransferComplete(struct libusb_transfer* transfer);
+    void handleTransferComplete(struct libusb_transfer* transfer, int index);
 
     static void feedbackCallback(struct libusb_transfer* transfer);
     void handleFeedbackComplete(struct libusb_transfer* transfer);
     void submitFeedbackTransfer();
 
     static void captureCallback(struct libusb_transfer* transfer);
-    void handleCaptureComplete(struct libusb_transfer* transfer);
+    void handleCaptureComplete(struct libusb_transfer* transfer, int index);
     void submitCaptureTransfer(int index);
 
     void ensureEventThread();
@@ -234,6 +245,7 @@ private:
     int packetsPerTransfer = 32;
     int playbackRingMs = 3000;
     struct libusb_transfer* transfers[MAX_NUM_TRANSFERS] = {};
+    XferCtx transferCtx[MAX_NUM_TRANSFERS] = {};
     uint8_t* transferBuffers[MAX_NUM_TRANSFERS] = {};
     int transferBufSize = 0;
     std::atomic<int> activeTransfers{0};
@@ -311,6 +323,7 @@ private:
     int capPacketsPerTransfer = 16;
     int capRingMs = 1000;
     struct libusb_transfer* capTransfers[MAX_CAP_NUM_TRANSFERS] = {};
+    XferCtx capTransferCtx[MAX_CAP_NUM_TRANSFERS] = {};
     uint8_t* capTransferBuffers[MAX_CAP_NUM_TRANSFERS] = {};
     int capTransferBufSize = 0;
     std::atomic<int> capActiveTransfers{0};
