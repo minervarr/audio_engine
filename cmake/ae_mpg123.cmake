@@ -42,8 +42,16 @@ function(ae_add_mpg123 TARGET)
     # config.h location: build-generated, per platform, outside the pristine tree.
     if(ANDROID)
         set(_cfg ${AE_THIRD_PARTY}/mpg123-config/android)
+    elseif(UNIX AND NOT APPLE)
+        # See that file's header for why it is a verbatim copy of the Android
+        # one rather than its own ./configure run.
+        set(_cfg ${AE_THIRD_PARTY}/mpg123-config/linux)
     else()
-        message(FATAL_ERROR "ae_add_mpg123: only the Android config is vendored so far")
+        message(FATAL_ERROR
+            "ae_add_mpg123: no vendored config.h for this platform yet "
+            "(have: android, linux). Generate one with mpg123's "
+            "`./configure --with-cpu=generic --disable-modules` and drop its "
+            "src/config.h into third_party/mpg123-config/<platform>/.")
     endif()
 
     # PUBLIC: consumers include <mpg123.h>. PRIVATE: config.h + internal headers.
@@ -57,5 +65,14 @@ function(ae_add_mpg123 TARGET)
         HAVE_CONFIG_H OPT_GENERIC REAL_IS_FLOAT)
 
     # Vendored C: build quietly (we do not patch upstream to fix warnings).
-    target_compile_options(${TARGET} PRIVATE -w -O2 -ffast-math)
+    # -ffast-math is upstream mpg123's own CFLAGS choice, kept as-is. It does
+    # NOT contradict the engine's "never -ffast-math" rule: that rule governs
+    # core/dsp/, whose output dsp_null_test asserts bit-identical across
+    # platforms. This is a vendored lossy decoder built with its author's
+    # flags, and nothing in core/ is compiled with them.
+    if(MSVC)
+        target_compile_options(${TARGET} PRIVATE /w /O2 /fp:fast)
+    else()
+        target_compile_options(${TARGET} PRIVATE -w -O2 -ffast-math)
+    endif()
 endfunction()

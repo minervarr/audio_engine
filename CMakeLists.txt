@@ -57,6 +57,70 @@ else()
     target_compile_options(ae_usb PRIVATE -O3 -funroll-loops)
 endif()
 
+# --- Decoder backends ---------------------------------------------------------
+# FLAC / MP3 / DSD decode, the same first-party implementations Android has
+# used since Phase 2.5/2.6 — built here so desktop stops needing a separate
+# single-header decoder in the consuming app. All three implement ae::Decoder
+# (core/include/core/decoder.hpp) and are selected by magic bytes, not by
+# extension. Cross-platform C++17 over fd-based IO.
+#
+# Opt-out exists because two of them carry vendored dependencies: libFLAC is a
+# submodule (may be unpopulated in a shallow clone) and libmpg123 is a
+# download (initialize_files.py). A consumer that wants neither can build the
+# USB path alone, as before.
+option(AUDIO_ENGINE_BUILD_DECODERS "Build the FLAC/MP3/DSD decoder backends" ON)
+
+if(AUDIO_ENGINE_BUILD_DECODERS)
+    # DSD: pure C++17, zero external deps — DFF/DSF parsing plus the DoP/native
+    # packer in core/dsp/dsd/. Nothing to vendor, so it is unconditional.
+    add_library(ae_dsd STATIC
+        ${AE_BACKENDS}/dsd/dsd_decoder.cpp
+        ${AE_BACKENDS}/dsd/dsf_parser.cpp
+        ${AE_BACKENDS}/dsd/dff_parser.cpp)
+    target_include_directories(ae_dsd PUBLIC ${AE_BACKENDS}/dsd)
+    target_link_libraries(ae_dsd PUBLIC ae_core)
+
+    # FLAC: vendored libFLAC submodule, kept pristine — configured ONLY through
+    # cache vars (never patched), same rule the Android build follows. Its
+    # default ON options would otherwise build the flac/metaflac CLI tools,
+    # libFLAC++, the test suite and docs, none of which we link.
+    if(EXISTS ${AE_THIRD_PARTY}/flac/CMakeLists.txt)
+        set(BUILD_CXXLIBS              OFF CACHE BOOL "" FORCE)
+        set(BUILD_PROGRAMS             OFF CACHE BOOL "" FORCE)
+        set(BUILD_EXAMPLES             OFF CACHE BOOL "" FORCE)
+        set(BUILD_TESTING              OFF CACHE BOOL "" FORCE)
+        set(BUILD_DOCS                 OFF CACHE BOOL "" FORCE)
+        set(INSTALL_MANPAGES           OFF CACHE BOOL "" FORCE)
+        set(INSTALL_PKGCONFIG_MODULES  OFF CACHE BOOL "" FORCE)
+        set(INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+        set(WITH_OGG                   OFF CACHE BOOL "" FORCE)
+        add_subdirectory(${AE_THIRD_PARTY}/flac ${CMAKE_BINARY_DIR}/third_party/flac
+                         EXCLUDE_FROM_ALL)
+
+        add_library(ae_flac STATIC ${AE_BACKENDS}/flac/flac_decoder.cpp)
+        target_include_directories(ae_flac PUBLIC ${AE_BACKENDS}/flac)
+        target_link_libraries(ae_flac PUBLIC ae_core FLAC)
+    else()
+        message(WARNING "third_party/flac is empty — skipping ae_flac. "
+                        "Run `git submodule update --init --recursive`.")
+    endif()
+
+    # MP3: vendored libmpg123 (downloaded, not committed). ae_add_mpg123 itself
+    # hard-errors with the fetch instruction when the source is missing, so
+    # check first and degrade to a warning — an absent optional codec must not
+    # break a build that only wants USB + FLAC.
+    if(EXISTS ${AE_THIRD_PARTY}/mpg123/src/libmpg123/libmpg123.c)
+        include(${AE_ROOT}/cmake/ae_mpg123.cmake)
+        ae_add_mpg123(mpg123)
+        add_library(ae_mp3 STATIC ${AE_BACKENDS}/mp3/mp3_decoder.cpp)
+        target_include_directories(ae_mp3 PUBLIC ${AE_BACKENDS}/mp3)
+        target_link_libraries(ae_mp3 PUBLIC ae_core mpg123)
+    else()
+        message(WARNING "third_party/mpg123 not fetched — skipping ae_mp3. "
+                        "Run `python3 initialize_files.py`.")
+    endif()
+endif()
+
 # --- DSP tests + benchmark ----------------------------------------------------
 # Debug-only, and deliberately NOT inside the Linux block below: both are pure
 # C++17 over header-only core/ code, so they build and run on every desktop
