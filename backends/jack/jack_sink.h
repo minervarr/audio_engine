@@ -78,12 +78,35 @@ public:
     // dead client forever.
     bool hasFaulted() const { return faulted.load(std::memory_order_acquire); }
 
+    // True once libjack has torn this client down under us — see live().
+    bool serverIsGone() const { return serverGone.load(std::memory_order_acquire); }
+
     // Ring underruns (we starved the callback) vs server xruns (the server
     // missed its deadline). Different causes, opposite fixes — never merge them.
     int underrunCount() const { return underruns.load(std::memory_order_relaxed); }
     int xrunCount()     const { return xruns.load(std::memory_order_relaxed); }
 
 private:
+    // The ONLY legal way to reach `client` from a jack_* call.
+    //
+    // When the server dies (or the client is zombified) libjack invokes the
+    // shutdown callback and DESTROYS the client object; `client` is a dangling
+    // pointer from that moment on. It is not null, and the memory usually stays
+    // mapped, so every `if (client)` guard still passes — and the next jack_*
+    // call loads a freed vtable pointer out of it and jumps through it. That is
+    // not theoretical: it is a captured SIGSEGV, inside jack_port_unregister(),
+    // from close() running in the consuming app's destructor. The freed chunk
+    // held glibc's tcache poison where the vptr belongs.
+    //
+    // So: after serverGone, this returns nullptr and every caller no-ops. The
+    // handle is deliberately LEAKED rather than passed to jack_client_close(),
+    // which would be the same use-after-free by another name. One leaked client
+    // struct at the moment its server has already died is not a cost worth
+    // crashing to avoid — do not "tidy this up" into a close call.
+    jack_client_t* live() const {
+        return serverGone.load(std::memory_order_acquire) ? nullptr : client;
+    }
+
     static int processTrampoline(uint32_t nframes, void* arg);
     int process(uint32_t nframes);
     // JACK2 runs these with the graph stopped (buffer size) or off the RT
@@ -112,6 +135,12 @@ private:
     // would consume the pre-buffer into ports nobody is listening to yet.
     std::atomic<bool> connected{false};
     std::atomic<bool> faulted{false};
+    // Set by shutdownTrampoline and never cleared for this client. Separate
+    // from `faulted`, which is the APP's signal to stop playing: this one is
+    // narrower and harder — "the handle itself is no longer touchable". See
+    // live(). Atomic because the shutdown callback runs on libjack's own
+    // notification thread, not ours.
+    std::atomic<bool> serverGone{false};
     std::atomic<int>  xruns{0};
     // Cached jack_get_buffer_size(); refreshed by the buffer-size callback.
     std::atomic<int>  serverPeriod{0};

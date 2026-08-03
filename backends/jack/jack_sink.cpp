@@ -17,11 +17,19 @@ JackSink::~JackSink() {
 bool JackSink::open(const std::string& clientName) {
     if (client) close();
     jack_status_t status;
+    serverGone.store(false, std::memory_order_release);   // fresh handle
     client = jack_client_open(clientName.c_str(), JackNoStartServer, &status);
     if (!client) {
         LOGE("jack_client_open failed (status 0x%x) — is jackd running?", status);
         return false;
     }
+    // Registered HERE, not in start(), because the handle can die at any point
+    // in its life — including while it is only being used to enumerate the
+    // graph, which is exactly what a settings UI does. Registering it in
+    // start() left every never-started client with no way to learn it had been
+    // torn down, so live() could not protect the one path that then crashed:
+    // close(). See live()'s comment in the header.
+    jack_on_shutdown(client, &JackSink::shutdownTrampoline, this);
     if (status & JackNameNotUnique) {
         LOGI("client name in use, server assigned: %s", jack_get_client_name(client));
     }
@@ -32,10 +40,11 @@ bool JackSink::open(const std::string& clientName) {
 
 std::vector<JackPlaybackPortInfo> JackSink::enumeratePlaybackPorts() {
     std::vector<JackPlaybackPortInfo> out;
-    if (!client) return out;
+    jack_client_t* c = live();
+    if (!c) return out;
     // Physical playback sinks CONSUME audio, so they are INPUT ports from the
     // graph's viewpoint.
-    const char** ports = jack_get_ports(client, nullptr, JACK_DEFAULT_AUDIO_TYPE,
+    const char** ports = jack_get_ports(c, nullptr, JACK_DEFAULT_AUDIO_TYPE,
                                         JackPortIsInput | JackPortIsPhysical);
     if (!ports) return out;
     for (int i = 0; ports[i]; ++i) {
@@ -46,10 +55,11 @@ std::vector<JackPlaybackPortInfo> JackSink::enumeratePlaybackPorts() {
 }
 
 bool JackSink::configure(const ae::AudioFormat& fmt) {
-    if (!client || streaming.load()) return false;
+    jack_client_t* c = live();
+    if (!c || streaming.load()) return false;
     if (fmt.channels < 1) return false;
 
-    int serverRate = (int)jack_get_sample_rate(client);
+    int serverRate = (int)jack_get_sample_rate(c);
     if (fmt.sampleRate > 0 && fmt.sampleRate != serverRate) {
         LOGI("rate hint %d ignored — the JACK server runs at %d Hz", fmt.sampleRate, serverRate);
     }
@@ -57,17 +67,17 @@ bool JackSink::configure(const ae::AudioFormat& fmt) {
         LOGI("bit-depth hint %d ignored — JACK processes float32", fmt.bitDepth);
     }
 
-    for (jack_port_t* p : outputPorts) jack_port_unregister(client, p);
+    for (jack_port_t* p : outputPorts) jack_port_unregister(c, p);
     outputPorts.clear();
 
     for (int i = 0; i < fmt.channels; ++i) {
         char name[32];
         snprintf(name, sizeof(name), "out_%d", i + 1);
-        jack_port_t* p = jack_port_register(client, name, JACK_DEFAULT_AUDIO_TYPE,
+        jack_port_t* p = jack_port_register(c, name, JACK_DEFAULT_AUDIO_TYPE,
                                             JackPortIsOutput, 0);
         if (!p) {
             LOGE("jack_port_register(%s) failed", name);
-            for (jack_port_t* q : outputPorts) jack_port_unregister(client, q);
+            for (jack_port_t* q : outputPorts) jack_port_unregister(c, q);
             outputPorts.clear();
             return false;
         }
@@ -91,7 +101,7 @@ bool JackSink::configure(const ae::AudioFormat& fmt) {
 
     // Size the scatter scratch generously up front; the buffer-size callback
     // keeps it correct if the server's period changes later.
-    serverPeriod.store((int)jack_get_buffer_size(client), std::memory_order_relaxed);
+    serverPeriod.store((int)jack_get_buffer_size(c), std::memory_order_relaxed);
     scratch.resize((size_t)serverPeriod.load(std::memory_order_relaxed) * chans);
 
     acceptingWrites.store(true, std::memory_order_release);
@@ -105,24 +115,24 @@ bool JackSink::start() {
 }
 
 bool JackSink::start(const std::vector<std::string>& destPorts) {
-    if (!client || outputPorts.empty() || streaming.load()) return false;
+    jack_client_t* c = live();
+    if (!c || outputPorts.empty() || streaming.load()) return false;
     if (!ring) { LOGE("start() before configure() — no ring"); return false; }
 
-    jack_set_process_callback(client, &JackSink::processTrampoline, this);
+    jack_set_process_callback(c, &JackSink::processTrampoline, this);
     // The server may change its period at any time. Without this callback
     // process() would read nframes*chans floats into a scratch sized for the
     // OLD period — a heap overflow, not merely a glitch.
-    jack_set_buffer_size_callback(client, &JackSink::bufferSizeTrampoline, this);
+    jack_set_buffer_size_callback(c, &JackSink::bufferSizeTrampoline, this);
     // Server-side deadline misses. Counted apart from our own ring underruns:
     // an xrun means jackd's period is too small for the machine, an underrun
     // means we starved it. Merging them hides which one is happening.
-    jack_set_xrun_callback(client, &JackSink::xrunTrampoline, this);
-    // Without this a server exit leaves the client zombied and playback simply
-    // stops, with nothing in the app able to notice.
-    jack_on_shutdown(client, &JackSink::shutdownTrampoline, this);
+    jack_set_xrun_callback(c, &JackSink::xrunTrampoline, this);
+    // (jack_on_shutdown is registered in open() — the handle can die before
+    // anything ever starts. See live().)
 
     streaming.store(true, std::memory_order_release);
-    if (jack_activate(client) != 0) {
+    if (jack_activate(c) != 0) {
         LOGE("jack_activate failed");
         streaming.store(false, std::memory_order_release);
         return false;   // the ring belongs to configure(); leave it intact
@@ -144,7 +154,7 @@ bool JackSink::start(const std::vector<std::string>& destPorts) {
         return false;
     }
     for (int i = 0; i < chans; ++i) {
-        int err = jack_connect(client, jack_port_name(outputPorts[i]), dests[i].c_str());
+        int err = jack_connect(c, jack_port_name(outputPorts[i]), dests[i].c_str());
         if (err != 0 && err != EEXIST) {
             LOGE("jack_connect(%s -> %s) failed (%d)", jack_port_name(outputPorts[i]),
                  dests[i].c_str(), err);
@@ -159,8 +169,8 @@ bool JackSink::start(const std::vector<std::string>& destPorts) {
     connected.store(true, std::memory_order_release);
     LOGI("streaming: pre-buffer %zu / %zu bytes (%.0f ms)",
          ringAvailable(), ringCapacity(),
-         chans > 0 && jack_get_sample_rate(client) > 0
-             ? ringAvailable() * 1000.0 / (chans * sizeof(float) * jack_get_sample_rate(client))
+         chans > 0 && jack_get_sample_rate(c) > 0
+             ? ringAvailable() * 1000.0 / (chans * sizeof(float) * jack_get_sample_rate(c))
              : 0.0);
     return true;
 }
@@ -232,6 +242,11 @@ int JackSink::xrunTrampoline(void* arg) {
 
 void JackSink::shutdownTrampoline(void* arg) {
     auto* self = static_cast<JackSink*>(arg);
+    // FIRST, before anything else: the handle is untouchable from here on.
+    // libjack destroys the client object around this callback, so every later
+    // jack_* call on it is a use-after-free — including the ones in our own
+    // close(), which is where it actually crashed. live() reads this.
+    self->serverGone.store(true, std::memory_order_release);
     // The client is gone; the caller must stop rather than keep feeding it.
     self->connected.store(false, std::memory_order_release);
     self->acceptingWrites.store(false, std::memory_order_release);
@@ -302,7 +317,9 @@ void JackSink::stop() {
     connected.store(false, std::memory_order_release);
     streaming.store(false, std::memory_order_release);
     if (activated) {
-        jack_deactivate(client);
+        // A dead server has already deactivated us, and asking a freed client
+        // to do it again is the crash this whole guard exists for.
+        if (jack_client_t* c = live()) jack_deactivate(c);
         activated = false;
     }
     int n = underruns.load();
@@ -319,14 +336,41 @@ void JackSink::close() {
     stop();
     delete ring;
     ring = nullptr;
-    for (jack_port_t* p : outputPorts) jack_port_unregister(client, p);
+
+    jack_client_t* c = live();
+    if (!c) {
+        // The server died under us and libjack freed this client already —
+        // proven, not assumed: a captured core dump has jack_port_unregister()
+        // faulting right here on a chunk carrying glibc's tcache poison where
+        // the vtable pointer belongs. Unregistering the ports and closing the
+        // client are BOTH use-after-frees at this point, so we do neither and
+        // let the handle go. See live() in the header before changing this.
+        LOGI("server already gone — releasing the client handle without touching it");
+        outputPorts.clear();
+        client = nullptr;
+        chans  = 0;
+        return;
+    }
+
+    // Residual race, stated rather than pretended away: the shutdown callback
+    // runs on libjack's own notification thread, so a server dying in the
+    // instant between live() above and the calls below still lands in the old
+    // window. Nothing outside libjack can close that gap. It is a hair wide;
+    // the bug this replaced was the whole door — every close() after ANY
+    // shutdown crashed, deterministically.
+
+    for (jack_port_t* p : outputPorts) jack_port_unregister(c, p);
     outputPorts.clear();
-    jack_client_close(client);
+    jack_client_close(c);
     client = nullptr;
     chans = 0;
 }
 
 ae::AudioFormat JackSink::activeFormat() const {
-    int rate = client ? (int)jack_get_sample_rate(client) : 0;
+    // Reached from the app's own timer tick (PlayerWindow::onTimer ->
+    // getConfiguredRate), so it runs long after a server can have died. Must
+    // go through live() like every other jack_* call.
+    jack_client_t* c = live();
+    int rate = c ? (int)jack_get_sample_rate(c) : 0;
     return { rate, chans, 32, 4, true };
 }
