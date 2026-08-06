@@ -6,6 +6,7 @@
 #include <cmath>
 
 #include "core/dsp/round.h"
+#include "core/dsp/wire_scale.h"
 
 // ---------------------------------------------------------------------------
 // Cascaded biquad EQ, 64-bit double throughout.
@@ -137,7 +138,7 @@ public:
 
     // EQ int32 input and write to double[] without quantizing back.
     // Used when a downstream stage (resample + dither) handles the final quantize.
-    void processToDouble(const int32_t* in, double* out, int count) {
+    void processToDouble(const int32_t* __restrict in, double* __restrict out, int count) {
         // Scale straight into the caller's buffer, then filter it in place —
         // no scratch needed, and the conversion loop vectorises.
         //
@@ -150,9 +151,9 @@ public:
     }
 
     // Bypass: just scale int32 to double without filter math.
-    static void scaleToDouble(const int32_t* in, double* out, int count) {
+    static void scaleToDouble(const int32_t* __restrict in, double* __restrict out, int count) {
         for (int i = 0; i < count; i++)
-            out[i] = in[i] * (1.0 / 2147483647.0);
+            out[i] = in[i] * (1.0 / ae::kInt32Max);
     }
 
 private:
@@ -191,7 +192,7 @@ private:
     // (double)preampLinear, not some higher-precision value. Keep it that way.
     // Folded into the cascade loops rather than run as its own pass over the
     // buffer: `hasPreamp` is loop-invariant, so the compiler unswitches it out.
-    void processBlock(double* io, int frames) {
+    void processBlock(double* __restrict io, int frames) {
         if (frames <= 0) return;
         if (channelCount == 2) processStereoCascade(io, frames);
         else                   processGenericCascade(io, frames);
@@ -202,7 +203,7 @@ private:
     // shuffling — which is what makes the stereo case worth special-casing.
     // One frame walks the full cascade before the next frame begins; see the
     // loop-ordering note at the top of this file.
-    void processStereoCascade(double* io, int frames) {
+    void processStereoCascade(double* __restrict io, int frames) {
 #if EQ_HAS_SSE2
         const __m128d preamp = _mm_set1_pd(static_cast<double>(preampLinear));
         for (int i = 0; i < frames; i++) {
@@ -274,7 +275,7 @@ private:
     // Mono, or anything above stereo. Channel-innermost gives the CPU one
     // independent recurrence per channel to overlap, for the same reason the
     // stereo path pairs L and R.
-    void processGenericCascade(double* io, int frames) {
+    void processGenericCascade(double* __restrict io, int frames) {
         const int ch = channelCount;
         const double preamp = static_cast<double>(preampLinear);
         for (int i = 0; i < frames; i++) {
@@ -300,9 +301,31 @@ private:
     // call — see core/dsp/round.h.
     static inline int32_t quantize32(double s) {
         if (s > 1.0) s = 1.0; else if (s < -1.0) s = -1.0;
-        long long q = ae::roundHalfAway(s * 2147483647.0);
-        if (q > 2147483647LL) q = 2147483647LL;
-        else if (q < -2147483648LL) q = -2147483648LL;
+        long long q = ae::roundHalfAway(s * ae::kInt32Max);
+        if (q > (long long)ae::kInt32Max) q = (long long)ae::kInt32Max;
+        else if (q < (long long)ae::kInt32Min) q = (long long)ae::kInt32Min;
+        return static_cast<int32_t>(q);
+    }
+
+    // Same rounding discipline as quantize32, scaled to 16/24-bit grids.
+    // process16/process24 used to truncate toward zero here (a bare
+    // static_cast), which is a correlated-distortion bug at these depths for
+    // exactly the reason quantize32's own comment explains — round-to-nearest
+    // is what "single, final snap to the wire" is supposed to mean regardless
+    // of target width.
+    static inline int16_t quantize16(double s) {
+        if (s > 1.0) s = 1.0; else if (s < -1.0) s = -1.0;
+        long long q = ae::roundHalfAway(s * ae::kInt16Max);
+        if (q > (long long)ae::kInt16Max) q = (long long)ae::kInt16Max;
+        else if (q < (long long)ae::kInt16Min) q = (long long)ae::kInt16Min;
+        return static_cast<int16_t>(q);
+    }
+
+    static inline int32_t quantize24(double s) {
+        if (s > 1.0) s = 1.0; else if (s < -1.0) s = -1.0;
+        long long q = ae::roundHalfAway(s * ae::kInt24Max);
+        if (q > (long long)ae::kInt24Max) q = (long long)ae::kInt24Max;
+        else if (q < (long long)ae::kInt24Min) q = (long long)ae::kInt24Min;
         return static_cast<int32_t>(q);
     }
 
@@ -336,11 +359,7 @@ private:
             int16_t* p = samples + (size_t)base * ch;
             for (int i = 0; i < n; i++) scratch[i] = p[i] / 32768.0;
             processBlock(scratch, frames);
-            for (int i = 0; i < n; i++) {
-                double s = scratch[i];
-                if (s > 1.0) s = 1.0; else if (s < -1.0) s = -1.0;
-                p[i] = static_cast<int16_t>(s * 32767.0);
-            }
+            for (int i = 0; i < n; i++) p[i] = quantize16(scratch[i]);
         }
     }
 
@@ -360,9 +379,7 @@ private:
             }
             processBlock(scratch, frames);
             for (int i = 0; i < n; i++) {
-                double s = scratch[i];
-                if (s > 1.0) s = 1.0; else if (s < -1.0) s = -1.0;
-                const int32_t out = static_cast<int32_t>(s * 8388607.0);
+                const int32_t out = quantize24(scratch[i]);
                 const int off = i * 3;
                 p[off]     = out & 0xFF;
                 p[off + 1] = (out >> 8) & 0xFF;

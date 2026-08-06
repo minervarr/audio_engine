@@ -326,6 +326,15 @@ int main() {
                 consumeBuf(out.data(), out.size() * 4);
             }));
         }
+        ae::NoiseShapedQuantizer nsq;
+        for (int bits : {16, 24, 32}) {
+            char label[64];
+            snprintf(label, sizeof(label), "ae::NoiseShapedQuantizer  %d-bit, stereo", bits);
+            report(label, bench(kSamples, [&] {
+                nsq.process(f64.data(), out.data(), kSamples, bits, 2);
+                consumeBuf(out.data(), out.size() * 4);
+            }));
+        }
     }
 
     // ---------------------------------------------------------- rounding ---

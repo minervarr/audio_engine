@@ -60,6 +60,13 @@ bool DsdDecoder::open(int fd, int64_t /*offset*/, int64_t /*length*/) {
 
     left_.assign(blockSize_, 0);
     right_.assign(blockSize_, 0);
+    // Worst case DoP at 4-byte subslot = 2 wire bytes per DSD byte per
+    // channel — reserve it once here so read()'s per-block resize() below
+    // never reallocates (resize() within an already-reserved capacity is
+    // guaranteed non-allocating), matching the project's "never allocate on
+    // the streaming loop" convention instead of relying on clear() happening
+    // not to release capacity.
+    packed_.reserve((size_t)blockSize_ * channels_ * 2);
     rebuildFormat();
     return format_.valid();
 }
@@ -104,7 +111,8 @@ int DsdDecoder::read(uint8_t* out, int maxLen) {
         }
     }
 
-    // Worst case DoP at 4-byte subslot = 2 wire bytes per DSD byte per channel.
+    // Capacity for this was reserved once in open() at the same worst-case
+    // size, so this never reallocates.
     packed_.resize((size_t)blockSize_ * channels_ * 2);
     int packedLen = DsdPackager::packDop(left_.data(), right_.data(), blockSize_,
                                          channels_, packed_.data(), dopCounter_,

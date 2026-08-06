@@ -15,6 +15,7 @@
 #include <cstdint>
 
 #include "core/dsp/round.h"
+#include "core/dsp/wire_scale.h"
 
 namespace ae {
 
@@ -27,17 +28,17 @@ inline int32_t snapToWire(double s, double scale) {
     if (s >  1.0) s =  1.0;
     if (s < -1.0) s = -1.0;
     long long q = roundHalfAway(s * scale);
-    if (q >  2147483647LL) q =  2147483647LL;
-    if (q < -2147483648LL) q = -2147483648LL;
+    if (q >  (long long)kInt32Max) q =  (long long)kInt32Max;
+    if (q < (long long)kInt32Min) q = (long long)kInt32Min;
     return static_cast<int32_t>(q);
 }
 
 // Wire scale for a target bit depth. Output is always int32 wire format, with
 // the unused low bits zeroed for 16/24-bit targets.
 inline double wireScale(int bits) {
-    return (bits == 16) ? 32767.0   * (double)(1 << 16)
-         : (bits == 24) ? 8388607.0 * (double)(1 << 8)
-         :                2147483647.0;
+    return (bits == 16) ? kInt16Max * (double)(1 << 16)
+         : (bits == 24) ? kInt24Max * (double)(1 << 8)
+         :                kInt32Max;
 }
 
 // TPDF dither generator + quantizer. Holds its own LCG state so the noise
@@ -53,7 +54,7 @@ public:
     // multiplies per sample to build a value it then scaled by zero and added
     // to nothing. It measured as an identical cost at 16, 24 and 32 bits —
     // the tell that full-depth output was paying for dither it discards.
-    void process(const double* in, int32_t* out, int n, int bits) {
+    void process(const double* __restrict in, int32_t* __restrict out, int n, int bits) {
         const double scale = wireScale(bits);
 
         if (bits >= 32) {
@@ -82,6 +83,75 @@ private:
         return state;
     }
     uint32_t state = 0x9E3779B9u;
+};
+
+// TPDF dither + FIRST-ORDER NOISE SHAPING. Same dither as TpdfQuantizer, plus
+// error feedback that pushes quantization noise toward the top of the band
+// instead of leaving it flat — a real, audible noise-floor improvement below
+// full depth, where the dither/quantization step is largest relative to the
+// signal (most audible at 16-bit output).
+//
+// Deliberately a SEPARATE class, not a modification of TpdfQuantizer:
+// TpdfQuantizer's flat-dither output is pinned exactly by
+// tests/dsp_null_test.cpp and must keep passing unchanged. This is new,
+// additively tested behaviour, wired in by the app only where it chooses to.
+//
+// Per-CHANNEL feedback state is required, not one shared scalar: samples
+// arrive interleaved (L,R,L,R,...), and folding channel A's quantization
+// error into channel B's next sample would leak one channel's shaped noise
+// into the other's spectrum instead of shaping each channel's own noise
+// independently.
+class NoiseShapedQuantizer {
+public:
+    static constexpr int MAX_CHANNELS = 8;
+
+    // Quantize `n` interleaved samples (n/channels frames) to `bits`. Same
+    // >=32-bit bypass as TpdfQuantizer: full depth needs neither dither nor
+    // shaping. `channels` beyond MAX_CHANNELS still get dithered and
+    // quantized correctly, just without shaping (no feedback slot to carry
+    // their error in) — this app is stereo-only in practice, MAX_CHANNELS
+    // just matches EqProcessor's own ceiling rather than inventing a new one.
+    void process(const double* __restrict in, int32_t* __restrict out, int n, int bits,
+                 int channels) {
+        const double scale = wireScale(bits);
+
+        if (bits >= 32 || channels <= 0) {
+            for (int i = 0; i < n; i++) out[i] = snapToWire(in[i], scale);
+            return;
+        }
+
+        const double ditherAmp = 1.0 / scale;
+        const int frames = n / channels;
+        for (int f = 0; f < frames; f++) {
+            const int base = f * channels;
+            for (int c = 0; c < channels; c++) {
+                const int i = base + c;
+                const double r = ditherAmp * ((double)(int32_t)(next() >> 1) -
+                                              (double)(int32_t)(next() >> 1))
+                               * (1.0 / 1073741824.0);
+
+                const double fb     = (c < MAX_CHANNELS) ? feedback[c] : 0.0;
+                const double shaped = in[i] + fb;
+                const int32_t q     = snapToWire(shaped + r, scale);
+                out[i] = q;
+
+                if (c < MAX_CHANNELS) {
+                    // Error carried forward, in the same normalized units as
+                    // `in`: what this sample SHOULD have been (post-feedback)
+                    // minus what it actually became once quantized.
+                    feedback[c] = shaped - (double)q / scale;
+                }
+            }
+        }
+    }
+
+private:
+    inline uint32_t next() {
+        state = state * 1664525u + 1013904223u;
+        return state;
+    }
+    uint32_t state = 0x9E3779B9u;
+    double feedback[MAX_CHANNELS] = {};
 };
 
 } // namespace ae

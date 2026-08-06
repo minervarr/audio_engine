@@ -1,6 +1,7 @@
 #include "usb_audio.h"
 #include "usb_pack.h"
 #include "core/dsp/round.h"
+#include "core/dsp/wire_scale.h"
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -760,7 +761,9 @@ bool UsbAudioDriver::parseDescriptors() {
     }
 
     LOGI("Parsed %zu format(s), UAC%d", formats.size(), uacVersion);
-    for (auto& f : formats) {
+    // f is read only inside LOGD, which compiles to a no-op unless
+    // USB_AUDIO_VERBOSE is set — see the LOGD macro definitions above.
+    for ([[maybe_unused]] auto& f : formats) {
         LOGD("  iface=%d alt=%d ep=0x%02x rate=%d ch=%d bits=%d subslot=%d bmFormats=0x%08x dsd=%d cap=%d clk=%d maxpkt=0x%04x fb=0x%02x",
              f.interfaceNum, f.altSetting, f.endpointAddr,
              f.sampleRate, f.channels, f.bitDepth, f.subslotSize,
@@ -799,15 +802,15 @@ bool UsbAudioDriver::setInterfaceAltSetting(int interface_num, int alt_setting) 
 bool UsbAudioDriver::setSampleRate(int endpoint, int rate) {
     // UAC1: 3-byte SET_CUR to endpoint
     uint8_t data[3];
-    data[0] = rate & 0xFF;
-    data[1] = (rate >> 8) & 0xFF;
-    data[2] = (rate >> 16) & 0xFF;
+    data[0] = static_cast<uint8_t>(rate & 0xFF);
+    data[1] = static_cast<uint8_t>((rate >> 8) & 0xFF);
+    data[2] = static_cast<uint8_t>((rate >> 16) & 0xFF);
 
     int rc = libusb_control_transfer(handle,
         LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_ENDPOINT,
         UAC_SET_CUR,
         0x0100, // SAMPLING_FREQ_CONTROL
-        endpoint,
+        static_cast<uint16_t>(endpoint),
         data, 3, 1000);
 
     if (rc < 0) {
@@ -822,10 +825,10 @@ bool UsbAudioDriver::setSampleRate(int endpoint, int rate) {
 bool UsbAudioDriver::setSampleRateUAC2(int clockId, int rate) {
     // UAC2: 4-byte SET_CUR to clock source entity on AC interface
     uint8_t data[4];
-    data[0] = rate & 0xFF;
-    data[1] = (rate >> 8) & 0xFF;
-    data[2] = (rate >> 16) & 0xFF;
-    data[3] = (rate >> 24) & 0xFF;
+    data[0] = static_cast<uint8_t>(rate & 0xFF);
+    data[1] = static_cast<uint8_t>((rate >> 8) & 0xFF);
+    data[2] = static_cast<uint8_t>((rate >> 16) & 0xFF);
+    data[3] = static_cast<uint8_t>((rate >> 24) & 0xFF);
 
     // wValue = CS << 8 | CN, CS = SAM_FREQ_CONTROL (0x01), CN = 0
     // wIndex = clock source ID << 8 | interface number
@@ -1062,7 +1065,8 @@ std::vector<int> UsbAudioDriver::queryUac2SampleRates(int clockId) {
                       | ((uint32_t)buf[off + 5] << 8)
                       | ((uint32_t)buf[off + 6] << 16)
                       | ((uint32_t)buf[off + 7] << 24);
-        uint32_t dRes = (uint32_t)buf[off + 8]
+        // Read only inside LOGD, a no-op unless USB_AUDIO_VERBOSE is set.
+        [[maybe_unused]] uint32_t dRes = (uint32_t)buf[off + 8]
                       | ((uint32_t)buf[off + 9] << 8)
                       | ((uint32_t)buf[off + 10] << 16)
                       | ((uint32_t)buf[off + 11] << 24);
@@ -1337,7 +1341,7 @@ void UsbAudioDriver::submitTransfer(int index) {
                 int32_t wire = (int32_t)((uint32_t)v << padBits);
                 for (int ch = 0; ch < configuredChannels; ch++) {
                     for (int b = 0; b < subslotBytes; b++) {
-                        buf[o++] = (wire >> (b * 8)) & 0xFF;
+                        buf[o++] = static_cast<uint8_t>((wire >> (b * 8)) & 0xFF);
                     }
                 }
             }
@@ -1653,7 +1657,7 @@ bool UsbAudioDriver::start() {
         transferCtx[i].drv = this;
         transferCtx[i].index = i;
         libusb_fill_iso_transfer(transfers[i], handle,
-            activeFormat.endpointAddr,
+            static_cast<unsigned char>(activeFormat.endpointAddr),
             transferBuffers[i], nominalBufSize,
             packetsPerTransfer,
             transferCallback, &transferCtx[i], 1000);
@@ -1750,7 +1754,7 @@ bool UsbAudioDriver::start() {
         if (feedbackTransfer) {
             memset(feedbackBuffer, 0, sizeof(feedbackBuffer));
             libusb_fill_iso_transfer(feedbackTransfer, handle,
-                activeFormat.feedbackEpAddr,
+                static_cast<unsigned char>(activeFormat.feedbackEpAddr),
                 feedbackBuffer, fbPktSize,
                 1, // 1 iso packet
                 feedbackCallback, this, 1000);
@@ -1848,7 +1852,7 @@ int UsbAudioDriver::write(const uint8_t* data, int length) {
     return (int)ringBuffer->write(data, length);
 }
 
-int UsbAudioDriver::writeFloat32(const float* data, int numSamples) {
+int UsbAudioDriver::writeFloat32(const float* __restrict data, int numSamples) {
     if (!ringBuffer) return -1;
 
     // subslotSize is the on-wire byte count per sample; bitDepth is the data range.
@@ -1880,9 +1884,7 @@ int UsbAudioDriver::writeFloat32(const float* data, int numSamples) {
         // flat noise floor, while at 24/32-bit the quantization error already
         // sits below any DAC's noise floor and dither would only waste
         // headroom.
-        const double quantScale = (configuredBitDepth == 24) ? 8388607.0
-                                : (configuredBitDepth == 32) ? 2147483647.0
-                                :                              32767.0;
+        const double quantScale = ae::wireScaleNative(configuredBitDepth);
         const bool ditherAndClamp16 =
             (configuredBitDepth != 24 && configuredBitDepth != 32);
 
@@ -2672,7 +2674,7 @@ bool UsbAudioDriver::startCapture() {
         capTransferCtx[i].drv = this;
         capTransferCtx[i].index = i;
         libusb_fill_iso_transfer(capTransfers[i], handle,
-            capActiveFormat.endpointAddr,
+            static_cast<unsigned char>(capActiveFormat.endpointAddr),
             capTransferBuffers[i], capTransferBufSize,
             capPacketsPerTransfer,
             captureCallback, &capTransferCtx[i], 1000);

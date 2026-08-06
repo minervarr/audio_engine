@@ -54,7 +54,7 @@ target_link_libraries(ae_usb PUBLIC ae_core usb1 Threads::Threads)
 if(MSVC)
     target_compile_options(ae_usb PRIVATE /O2 /fp:precise)
 else()
-    target_compile_options(ae_usb PRIVATE -O3 -funroll-loops)
+    target_compile_options(ae_usb PRIVATE -O3 -funroll-loops -Wall -Wextra -Wconversion)
 endif()
 
 # --- Decoder backends ---------------------------------------------------------

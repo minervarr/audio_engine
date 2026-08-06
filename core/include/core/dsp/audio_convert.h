@@ -19,8 +19,10 @@ public:
     // Returns uniform random in [-0.5, +0.5]
     inline float next() {
         state = state * 1664525u + 1013904223u;
-        // Convert upper bits to float in [0, 1), subtract 0.5
-        return (state >> 8) * (1.0f / 16777216.0f) - 0.5f;
+        // Convert upper bits to float in [0, 1), subtract 0.5. state >> 8 is
+        // a 24-bit value (0..16777215), exactly representable in float's
+        // 24-bit mantissa — the cast is exact, not a truncation.
+        return static_cast<float>(state >> 8) * (1.0f / 16777216.0f) - 0.5f;
     }
 
     // TPDF: sum of two uniform randoms -> triangular distribution in [-1, +1]

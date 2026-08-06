@@ -12,12 +12,15 @@
 //
 // Run: ./build/linux_debug/framework/audio_engine/dsp_null_test
 //
-// NOTE ON ARM: the live EqProcessor's NEON path uses vfmaq_f64 (fused
-// multiply-add), which skips an intermediate rounding step and is therefore
-// MORE accurate than — but not bit-identical to — the scalar reference. That
-// predates this test. On aarch64 the EQ section below asserts a tight error
-// bound instead of equality, and says so on stdout. On x86-64 (the SSE2 path,
-// deliberately non-FMA) equality is asserted and must hold exactly.
+// NOTE ON ARM: the live EqProcessor's NEON path used to use vfmaq_f64 (fused
+// multiply-add), which meant it was MORE accurate than — but not
+// bit-identical to — the scalar reference, and this test tolerated a tight
+// error bound on aarch64 instead of asserting equality. The NEON path no
+// longer uses FMA (separate mul/add/sub, matching x86's non-FMA SSE2 path),
+// so exact equality is now asserted on every architecture, x86-64 and
+// aarch64 alike. Not verified on real ARM hardware from this (x86-64) dev
+// machine — if it ever fails on an actual aarch64 build, investigate as a
+// real regression rather than reintroducing the error-bound tolerance.
 
 #undef NDEBUG
 #include <cassert>
@@ -404,14 +407,23 @@ static void fillSignal(Signal sig, std::vector<int32_t>& buf, int channels, int 
 }
 
 static void testEqProcessor() {
-#if defined(__aarch64__) && defined(__ARM_NEON)
-    printf("[2] EqProcessor vs frozen scalar oracle  (aarch64: NEON uses FMA, "
-           "asserting error bound instead of equality)\n");
-    const bool exact = false;
-#else
+    // The NEON path used to use vfmaq_f64 (fused multiply-add) and this test
+    // used to tolerate an error bound on aarch64 instead of asserting
+    // equality outright. That's no longer true: eq_processor.h's NEON path
+    // now uses separate mul/add/sub, matching x86's non-FMA SSE2 path (see
+    // its comment "NOT vfmaq_f64 — see the FMA note up top"), so exact
+    // equality is required on every architecture now, same as x86-64.
+    //
+    // NOT verified on real ARM hardware from this machine — this repo's dev
+    // environment is x86-64. If this ever fails on an actual aarch64 build,
+    // that is a real regression to investigate, not a reason to revert to
+    // tolerating an error bound.
     printf("[2] EqProcessor vs frozen scalar oracle  (exact equality required)\n");
     const bool exact = true;
-#endif
+
+    // Proves the process16/process24 rounding fix is actually exercised below,
+    // not silently a no-op — see the two ±1-LSB comparison blocks further down.
+    long roundVsTruncateDiffs = 0;
 
     const int sampleRate = 44100;
     const int frames = 4096;
@@ -513,9 +525,15 @@ static void testEqProcessor() {
                         ref .configure(n, coeffs, preamp, channels, 2);
                         live.process(reinterpret_cast<uint8_t*>(sa.data()), (int)sa.size() * 2);
                         ref .process(reinterpret_cast<uint8_t*>(sb.data()), (int)sb.size() * 2);
+                        // Deliberate divergence, not a regression: RefEqProcessor is a
+                        // frozen copy of process16 as it stood BEFORE this fix, which
+                        // truncated toward zero at the final quantize step. Live now
+                        // rounds to nearest (see EqProcessor::quantize16) — the two can
+                        // only ever differ by the last LSB, which is exactly what
+                        // round-vs-truncate can produce, never more.
                         for (size_t i = 0; i < sa.size(); ++i) {
-                            if (exact) CHECK(sa[i] == sb[i]);
-                            else       CHECK(std::abs(sa[i] - sb[i]) <= 1);
+                            CHECK(std::abs(sa[i] - sb[i]) <= 1);
+                            if (sa[i] != sb[i]) ++roundVsTruncateDiffs;
                         }
                         ++g_checks;
                     }
@@ -532,13 +550,32 @@ static void testEqProcessor() {
                         ref .configure(n, coeffs, preamp, channels, 21);
                         live.process(pa.data(), (int)pa.size());
                         ref .process(pb.data(), (int)pb.size());
-                        if (exact) CHECK(memcmp(pa.data(), pb.data(), pa.size()) == 0);
+                        // Same deliberate divergence as the int16 block above: live's
+                        // process24 now rounds (EqProcessor::quantize24) where the
+                        // frozen oracle still truncates, so compare decoded 24-bit
+                        // values with a 1-LSB tolerance instead of raw bytes.
+                        for (size_t i = 0; i < pa.size() / 3; ++i) {
+                            auto decode24 = [](const uint8_t* p) -> int32_t {
+                                int32_t v = p[0] | (p[1] << 8) | (p[2] << 16);
+                                if (v & 0x800000) v |= 0xFF000000;
+                                return v;
+                            };
+                            const int32_t va = decode24(pa.data() + i * 3);
+                            const int32_t vb = decode24(pb.data() + i * 3);
+                            CHECK(std::abs(va - vb) <= 1);
+                            if (va != vb) ++roundVsTruncateDiffs;
+                        }
                         ++g_checks;
                     }
                 }
             }
         }
     }
+
+    // If this were ever zero, the ±1-LSB tolerance above would be silently
+    // hiding a no-op fix rather than validating a real rounding change.
+    CHECK(roundVsTruncateDiffs > 0);
+    ++g_checks;
 
     // --- bypass and lifecycle behaviour ----------------------------------
     {
@@ -912,6 +949,132 @@ static void testDither() {
     printf("    ok\n");
 }
 
+// ===========================================================================
+// Section 6 — NoiseShapedQuantizer (first-order noise-shaped TPDF dither)
+//
+// Unlike the other oracles here, there is no "before optimization" version of
+// this to freeze — it's new. The oracle below is a frozen, independent copy
+// of the algorithm as implemented, written once and never updated to match
+// ae::NoiseShapedQuantizer afterward, same convention as every other section:
+// it exists to catch an ACCIDENTAL future change to the live class, not to
+// re-derive what the live class currently does.
+// ===========================================================================
+
+namespace oracle {
+
+static void noiseShapedQuantize(const double* in, int32_t* out, int n, int bits,
+                                int channels, uint32_t& lcgState, double* feedback,
+                                int maxChannels) {
+    auto lcgNext = [&]() -> uint32_t {
+        lcgState = lcgState * 1664525u + 1013904223u;
+        return lcgState;
+    };
+    double scale = (bits == 16) ? 32767.0   * (double)(1 << 16)
+                 : (bits == 24) ? 8388607.0 * (double)(1 << 8)
+                 :                2147483647.0;
+    if (bits >= 32 || channels <= 0) {
+        for (int i = 0; i < n; i++) {
+            double s = in[i];
+            if (s >  1.0) s =  1.0;
+            if (s < -1.0) s = -1.0;
+            long long q = llround(s * scale);
+            if (q >  2147483647LL) q =  2147483647LL;
+            if (q < -2147483648LL) q = -2147483648LL;
+            out[i] = (int32_t)q;
+        }
+        return;
+    }
+    const double ditherAmp = 1.0 / scale;
+    const int frames = n / channels;
+    for (int f = 0; f < frames; f++) {
+        const int base = f * channels;
+        for (int c = 0; c < channels; c++) {
+            const int i = base + c;
+            const double r = ditherAmp * ((double)(int32_t)(lcgNext() >> 1) -
+                                          (double)(int32_t)(lcgNext() >> 1))
+                           * (1.0 / 1073741824.0);
+            const double fb = (c < maxChannels) ? feedback[c] : 0.0;
+            const double shaped = in[i] + fb;
+            double s = shaped + r;
+            if (s >  1.0) s =  1.0;
+            if (s < -1.0) s = -1.0;
+            long long q = llround(s * scale);
+            if (q >  2147483647LL) q =  2147483647LL;
+            if (q < -2147483648LL) q = -2147483648LL;
+            out[i] = (int32_t)q;
+            if (c < maxChannels) feedback[c] = shaped - (double)out[i] / scale;
+        }
+    }
+}
+
+} // namespace oracle
+
+static void testNoiseShapedDither() {
+    printf("[6] NoiseShapedQuantizer vs frozen independent oracle\n");
+
+    const int n = 8192; // multiple of 2 channels
+    std::mt19937 rng(24601);
+    std::uniform_real_distribution<double> uni(-1.2, 1.2);
+    std::vector<double> in(n);
+    for (int i = 0; i < n; ++i) in[i] = uni(rng);
+    in[0] = 0.0; in[1] = 1.0; in[2] = -1.0; in[3] = 2.0; in[4] = -2.0;
+
+    for (int channels : {1, 2, 4, 8}) {
+        for (int bits : {16, 24, 32}) {
+            std::vector<int32_t> a(n), b(n);
+
+            uint32_t oracleState = 0x9E3779B9u;
+            double oracleFb[ae::NoiseShapedQuantizer::MAX_CHANNELS] = {};
+            oracle::noiseShapedQuantize(in.data(), a.data(), n, bits, channels,
+                                        oracleState, oracleFb,
+                                        ae::NoiseShapedQuantizer::MAX_CHANNELS);
+
+            ae::NoiseShapedQuantizer q; // fresh instance == same initial state
+            q.process(in.data(), b.data(), n, bits, channels);
+
+            for (int i = 0; i < n; ++i) {
+                if (a[i] != b[i]) {
+                    printf("    MISMATCH ch=%d bits=%d [%d]: live=%d ref=%d\n",
+                           channels, bits, i, b[i], a[i]);
+                    CHECK(false);
+                }
+            }
+            ++g_checks;
+
+            // Chunked must equal one-shot: feedback + dither state both have
+            // to carry across calls exactly as they do between audio callbacks.
+            uint32_t oracleState2 = 0x9E3779B9u;
+            double oracleFb2[ae::NoiseShapedQuantizer::MAX_CHANNELS] = {};
+            std::vector<int32_t> c(n);
+            oracle::noiseShapedQuantize(in.data(), c.data(), n, bits, channels,
+                                        oracleState2, oracleFb2,
+                                        ae::NoiseShapedQuantizer::MAX_CHANNELS);
+
+            ae::NoiseShapedQuantizer q2;
+            std::vector<int32_t> d(n);
+            const int chunk = 700 - (700 % std::max(1, channels)); // frame-aligned
+            for (int off = 0; off < n; off += chunk) {
+                const int len = std::min(chunk, n - off);
+                q2.process(in.data() + off, d.data() + off, len, bits, channels);
+            }
+            CHECK(memcmp(c.data(), d.data(), (size_t)n * 4) == 0);
+        }
+    }
+
+    // At 32-bit: pure quantize, no dither, no shaping — repeating must be
+    // idempotent regardless of how much feedback/dither state has advanced.
+    {
+        std::vector<int32_t> a(n), b(n);
+        ae::NoiseShapedQuantizer q1, q2;
+        q1.process(in.data(), a.data(), n, 32, 2);
+        q2.process(in.data(), b.data(), n, 32, 2);
+        q2.process(in.data(), b.data(), n, 32, 2);
+        CHECK(memcmp(a.data(), b.data(), (size_t)n * 4) == 0);
+    }
+
+    printf("    ok\n");
+}
+
 int main() {
     printf("=== dsp_null_test ===\n");
     testRounding();
@@ -919,6 +1082,7 @@ int main() {
     testRingBuffer();
     testWirePacking();
     testDither();
+    testNoiseShapedDither();
     printf("=== PASS (%d checks) ===\n", g_checks);
     return 0;
 }

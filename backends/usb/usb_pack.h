@@ -28,6 +28,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "core/dsp/wire_scale.h"
+
 namespace ae {
 namespace usbpack {
 
@@ -94,24 +96,24 @@ template <int Shift> inline int32_t shiftWire(int32_t v) {
 // --- gain application, matching each source width's clamp exactly ------------
 inline int32_t gainInt32(int32_t v, float gain) {
     // float carries 24 mantissa bits — enough for attenuation work, and this is
-    // what the original did. 2147483520.0f is the largest float below INT32_MAX.
+    // what the original did. kInt32MaxF is the largest float below INT32_MAX.
     float fs = static_cast<float>(v) * gain;
-    if (fs > 2147483520.0f) fs = 2147483520.0f;
-    else if (fs < -2147483648.0f) fs = -2147483648.0f;
+    if (fs > kInt32MaxF) fs = kInt32MaxF;
+    else if (fs < kInt32MinF) fs = kInt32MinF;
     return static_cast<int32_t>(fs);
 }
 
 inline int32_t gainInt24(int32_t v, float gain) {
     float fs = static_cast<float>(v) * gain;
-    if (fs > 8388607.0f) fs = 8388607.0f;
-    else if (fs < -8388608.0f) fs = -8388608.0f;
+    if (fs > kInt24MaxF) fs = kInt24MaxF;
+    else if (fs < kInt24MinF) fs = kInt24MinF;
     return static_cast<int32_t>(fs);
 }
 
 inline int32_t gainInt16(int16_t s, float gain) {
     float fs = static_cast<float>(s) * gain;
-    if (fs > 32767.0f) fs = 32767.0f;
-    else if (fs < -32768.0f) fs = -32768.0f;
+    if (fs > kInt16MaxF) fs = kInt16MaxF;
+    else if (fs < kInt16MinF) fs = kInt16MinF;
     return static_cast<int32_t>(fs);
 }
 
@@ -119,7 +121,7 @@ inline int32_t gainInt16(int16_t s, float gain) {
 // Returns bytes written. Sub == 4 at unity gain is a straight copy; callers
 // should short-circuit that case before ever staging through a buffer.
 template <int Sub>
-inline int packInt32(const int32_t* src, int n, uint8_t* dst, float gain) {
+inline int packInt32(const int32_t* __restrict src, int n, uint8_t* __restrict dst, float gain) {
     constexpr int kShift = Sub * 8 - 32;
     if (gain >= kUnityGain) {
         for (int i = 0; i < n; ++i)
@@ -133,7 +135,7 @@ inline int packInt32(const int32_t* src, int n, uint8_t* dst, float gain) {
 
 // --- int16 source -----------------------------------------------------------
 template <int Sub>
-inline int packInt16(const int16_t* src, int n, uint8_t* dst, float gain) {
+inline int packInt16(const int16_t* __restrict src, int n, uint8_t* __restrict dst, float gain) {
     constexpr int kShift = Sub * 8 - 16;
     if (gain >= kUnityGain) {
         for (int i = 0; i < n; ++i)
@@ -157,7 +159,7 @@ inline int32_t loadInt24(const uint8_t* p) {
 }
 
 template <int Sub>
-inline int packInt24(const uint8_t* src, int n, uint8_t* dst, float gain) {
+inline int packInt24(const uint8_t* __restrict src, int n, uint8_t* __restrict dst, float gain) {
     constexpr int kShift = Sub * 8 - 24;
     if (gain >= kUnityGain) {
         for (int i = 0; i < n; ++i)
