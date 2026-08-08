@@ -1,6 +1,6 @@
 #include "dsd_decoder.h"
 
-#include <unistd.h>
+#include "core/os_pread.h"
 #include <algorithm>
 #include <cstring>
 
@@ -26,7 +26,7 @@ const uint8_t* bitReverseTable() {
 
 bool magic4(int fd, const char* expect) {
     char b[4];
-    if (::pread(fd, b, 4, 0) != 4) return false;
+    if (osPread(fd, b, 4, 0) != 4) return false;
     return std::memcmp(b, expect, 4) == 0;
 }
 } // namespace

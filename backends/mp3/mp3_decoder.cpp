@@ -2,6 +2,7 @@
 
 #include <sys/stat.h>
 #include <unistd.h>
+#include "core/os_pread.h"
 #include <algorithm>
 #include <mutex>
 
@@ -144,7 +145,7 @@ long Mp3Decoder::onRead(void* buffer, unsigned long count) {
     int64_t remaining = regionLength_ - pos_;
     if (remaining <= 0) return 0;                       // EOF
     size_t want = std::min<uint64_t>(count, (uint64_t)remaining);
-    ssize_t got = ::pread(dupFd_, buffer, want, regionOffset_ + pos_);
+    ssize_t got = osPread(dupFd_, buffer, want, regionOffset_ + pos_);
     if (got < 0)  return -1;
     if (got == 0) return 0;
     pos_ += got;

@@ -44,12 +44,19 @@ function(ae_add_libusb TARGET)
     target_include_directories(${TARGET} PUBLIC ${_lu})
     target_include_directories(${TARGET} PRIVATE ${_lu}/os ${AE_THIRD_PARTY})
 
-    # config.h selection per platform.
+    # config.h selection per platform. Windows splits further on MSVC vs
+    # MinGW (GCC/Clang targeting *-w64-windows-gnu): the vendored msvc/
+    # config.h #errors out without _MSC_VER defined, which Clang never
+    # defines outside -fms-compatibility mode, and /W0 is an MSVC-only flag
+    # spelling that GNU-mode Clang's driver doesn't understand.
     if(ANDROID)
         target_include_directories(${TARGET} PRIVATE ${AE_THIRD_PARTY}/libusb/android)
-    elseif(WIN32)
+    elseif(MSVC)
         target_include_directories(${TARGET} PRIVATE ${AE_THIRD_PARTY}/libusb/msvc)
         target_compile_options(${TARGET} PRIVATE /W0)
+    elseif(WIN32)
+        target_include_directories(${TARGET} PRIVATE ${AE_THIRD_PARTY}/libusb/mingw)
+        target_compile_options(${TARGET} PRIVATE -w)
     else()
         if(NOT DEFINED AE_LIBUSB_CONFIG_DIR)
             message(FATAL_ERROR "ae_add_libusb: set AE_LIBUSB_CONFIG_DIR for desktop builds")

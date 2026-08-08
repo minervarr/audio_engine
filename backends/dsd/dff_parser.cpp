@@ -1,6 +1,6 @@
 #include "dff_parser.h"
 
-#include <unistd.h>
+#include "core/os_pread.h"
 #include <algorithm>
 #include <cstring>
 
@@ -12,7 +12,7 @@ bool readAt(int fd, int64_t off, void* buf, size_t n) {
     size_t got = 0;
     auto* p = static_cast<uint8_t*>(buf);
     while (got < n) {
-        ssize_t r = ::pread(fd, p + got, n - got, off + (int64_t)got);
+        ssize_t r = osPread(fd, p + got, n - got, off + (int64_t)got);
         if (r <= 0) return false;
         got += (size_t)r;
     }

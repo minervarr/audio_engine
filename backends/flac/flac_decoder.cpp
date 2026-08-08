@@ -2,6 +2,7 @@
 
 #include <sys/stat.h>
 #include <unistd.h>
+#include "core/os_pread.h"
 #include <algorithm>
 #include <cstring>
 
@@ -192,7 +193,7 @@ int FlacDecoder::onRead(uint8_t* buffer, size_t* bytes) {
     int64_t remaining = regionLength_ - pos_;
     if (remaining <= 0) { *bytes = 0; return 1; }
     size_t want = std::min(*bytes, (size_t)remaining);
-    ssize_t got = ::pread(dupFd_, buffer, want, regionOffset_ + pos_);
+    ssize_t got = osPread(dupFd_, buffer, want, regionOffset_ + pos_);
     if (got < 0)  { *bytes = 0; return 2; }
     if (got == 0) { *bytes = 0; return 1; }
     pos_ += got;
