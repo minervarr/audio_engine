@@ -156,6 +156,35 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     endforeach()
 endif()
 
+# --- Android-only backends ----------------------------------------------------
+#
+# Same shape as the ALSA/JACK block below: a real library target a consuming app
+# can link, with its include directory PUBLIC so the app does not restate paths.
+#
+# This did not exist. backends/aaudio/ has been committed since c222e34, but the
+# only CMake that ever compiled it was platform/android/'s own self-contained
+# Gradle project, which builds ONE library for this engine's own app and exports
+# nothing. A consumer (Matrix_Player/android) therefore linked `ae_aaudio` and
+# got "aaudio_sink.h file not found" -- a target that was never defined.
+#
+# Directive 4 says platforms are equal peers, each with its own build entry;
+# that is about entry POINTS, not about which platforms get reusable targets.
+# Linux has ae_alsa/ae_jack, so Android gets ae_aaudio.
+if(ANDROID)
+    # SINK ONLY, deliberately. aaudio_source.cpp is capture, which no consumer
+    # asks for today, and backends/mediacodec/ (AMediaCodec hardware decode) is
+    # not built at all: this engine decodes FLAC and MP3 with its own vendored
+    # libFLAC/libmpg123 ON PURPOSE, because some phones ship no FLAC decoder and
+    # a per-device decode path would make "bit-perfect everywhere" a claim that
+    # depends on the handset. Adding either later is one line each.
+    add_library(ae_aaudio STATIC ${AE_BACKENDS}/aaudio/aaudio_sink.cpp)
+    target_include_directories(ae_aaudio PUBLIC ${AE_BACKENDS}/aaudio)
+    # `aaudio` is the NDK's own libaaudio (API 26+, which is this engine's floor
+    # on Android anyway). It is the ONLY place <aaudio/AAudio.h> is included --
+    # directive 2, the single-includer rule.
+    target_link_libraries(ae_aaudio PUBLIC ae_core aaudio)
+endif()
+
 # --- Linux-only backends + tools ----------------------------------------------
 if(UNIX AND NOT APPLE AND NOT ANDROID)
     # ALSA: direct-hardware capture + playback, no sound server.
