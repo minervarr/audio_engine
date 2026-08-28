@@ -11,12 +11,13 @@ android {
     defaultConfig {
         minSdk 26
         consumerProguardFiles 'proguard-rules.pro'
-        // 64-bit ABIs only: arm64-v8a is every modern Android phone/tablet,
-        // x86_64 is the emulator. Google Play has required 64-bit since 2019.
-        // Dropping the legacy 32-bit ABIs (armeabi-v7a/x86) also sidesteps
-        // libFLAC's 32-bit-Android fseeko/ftello cross-compile quirk entirely.
+        // arm64-v8a is every modern Android phone/tablet, x86_64 is the
+        // emulator, armeabi-v7a keeps 32-bit devices alive. The 32-bit bionic
+        // quirks in the vendored decoders (libFLAC's HAVE_FSEEKO probe,
+        // mpg123's SIZEOF_OFF_T) are handled in CMake — see the root
+        // CMakeLists.txt; x86 stays out: no device, no emulator need.
         ndk {
-            abiFilters 'arm64-v8a', 'x86_64'
+            abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86_64'
         }
         externalNativeBuild {
             cmake {

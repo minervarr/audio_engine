@@ -11,6 +11,14 @@ set(AE_API         ${AE_ROOT}/api)
 set(AE_BACKENDS    ${AE_ROOT}/backends)
 set(AE_THIRD_PARTY ${AE_ROOT}/third_party)
 
+# 32-bit Android (armeabi-v7a) quirks in the vendored decoders — see the long
+# comment in the repo-root CMakeLists.txt (this project repeats it in brief):
+# HAVE_FSEEKO stops libFLAC's compat.h from `#define fseeko fseek` into
+# bionic's real API-24 fseeko (bionic has had it since 24; our floor is 26),
+# and _FILE_OFFSET_BITS=64 gives 32-bit off_t the 8 bytes mpg123's committed
+# android config.h promises. Both are no-ops on 64-bit ABIs.
+add_compile_definitions(_FILE_OFFSET_BITS=64 HAVE_FSEEKO)
+
 # libusb static lib — one shared definition for every platform. On Android the
 # helper selects the usbfs backend + the vendored android/config.h.
 include(${AE_ROOT}/cmake/ae_libusb.cmake)
@@ -28,8 +36,8 @@ ae_add_lame(mp3lame)
 # libFLAC static lib (BSD-3-Clause; decoder + encoder) for native FLAC playback
 # and recording — identical on every OEM, unlike AMediaCodec. Build ONLY the
 # library: no CLI tools (those are GPL), no C++ wrapper/tests/docs, no Ogg.
-# We ship 64-bit ABIs only (see build.gradle abiFilters), so libFLAC's 32-bit
-# Android fseeko/ftello quirk never applies.
+# The 32-bit fseeko/ftello quirk is handled by HAVE_FSEEKO above; libFLAC stays
+# pristine (configured via CMake cache vars and compile definitions, never patched).
 set(BUILD_CXXLIBS             OFF CACHE BOOL "" FORCE)
 set(BUILD_PROGRAMS            OFF CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES            OFF CACHE BOOL "" FORCE)

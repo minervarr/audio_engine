@@ -20,6 +20,28 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# --- 32-bit Android (armeabi-v7a): two bionic quirks in the vendored decoders ---
+# Both matter only on 32-bit ABIs and are no-ops on arm64-v8a/x86_64, so the
+# definitions are applied unconditionally under Android to keep every TU in the
+# .so consistent.
+# 1. libFLAC: its HAVE_FSEEKO probe cannot win on 32-bit bionic (fseeko is
+#    __RENAME'd to fseeko64 at the ELF level, so the link probe finds no
+#    `fseeko` symbol), and its pre-API-24 guard can misfire the same way.
+#    compat.h then does `#define fseeko fseek`, which collides with bionic's
+#    REAL fseeko declaration (API >= 24) and breaks the build. bionic has had
+#    real fseeko/ftello since API 24 and this engine's floor is 26, so defining
+#    HAVE_FSEEKO at compile level is the truthful answer — and compat.h only
+#    ever tests it with #ifndef, so an empty-body definition is enough (it also
+#    matches the `#cmakedefine` config.h emits on the ABIs where the probe
+#    succeeds, avoiding a redefinition warning).
+# 2. libmpg123: the committed third_party/mpg123-config/android/config.h
+#    hardcodes SIZEOF_OFF_T 8; on 32-bit off_t is 4 bytes unless LFS is on, and
+#    lfs_wrap.c's static assert fires. _FILE_OFFSET_BITS=64 makes off_t 64-bit
+#    (exactly what that config was generated against). Harmless on 64-bit.
+if(ANDROID)
+    add_compile_definitions(_FILE_OFFSET_BITS=64 HAVE_FSEEKO)
+endif()
+
 set(AE_ROOT              ${CMAKE_CURRENT_SOURCE_DIR})
 set(AE_CORE              ${AE_ROOT}/core)
 set(AE_BACKENDS          ${AE_ROOT}/backends)
