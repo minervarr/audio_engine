@@ -110,6 +110,11 @@ int AAudioSink::pendingPlaybackMs() const {
     return (int)(pending * 1000 / format_.sampleRate);
 }
 
+int64_t AAudioSink::framesPlayed() const {
+    if (!stream_) return 0;
+    return AAudioStream_getFramesRead(stream_);
+}
+
 void AAudioSink::closeStream() {
     if (stream_) {
         AAudioStream_requestStop(stream_);

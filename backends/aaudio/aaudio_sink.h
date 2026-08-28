@@ -33,6 +33,20 @@ public:
     void flush() override;
     int  pendingPlaybackMs() const override;
 
+    // Frames the device has actually PLAYED since the stream started.
+    //
+    // The honest basis for an A/V clock, and not the same question
+    // pendingPlaybackMs() answers. A consumer can subtract that from its own
+    // written count, but only if both were sampled at the same instant — and
+    // on a player they are not: the audio thread writes while the render
+    // thread reads. A video player built that way saw its master clock run
+    // BACKWARDS by tens of milliseconds, which stalls the frame scheduler and
+    // reads on screen as a freeze every second or so.
+    //
+    // This counter only ever increases (until flush), so a clock derived from
+    // it cannot go backwards no matter when it is read.
+    int64_t framesPlayed() const;
+
 private:
     void closeStream();
 
