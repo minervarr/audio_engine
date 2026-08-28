@@ -2337,6 +2337,39 @@ std::vector<int> UsbAudioDriver::getOutputFormatTuples() const {
     return collectFormatTuples(formats, false);
 }
 
+std::vector<int> UsbAudioDriver::getDsdFormatTuples() const {
+    std::vector<int> out;
+    for (auto& f : formats) {
+        if (f.isCapture || !f.isDsd) continue;
+        const int flagged = (f.bmFormats & 0x80000000u) != 0 ? 1 : 0;
+        bool dup = false;
+        for (size_t i = 0; i + 3 < out.size(); i += 4) {
+            if (out[i] == f.sampleRate && out[i + 1] == f.channels
+                    && out[i + 2] == f.subslotSize) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            out.push_back(f.sampleRate);
+            out.push_back(f.channels);
+            // The SUBSLOT, not bBitResolution: for a RAW_DATA alt-setting the
+            // resolution field describes the container carrying the DSD bit
+            // stream, and reporting it as a sample depth is how DSD ends up
+            // looking like a 32-bit PCM mode a caller may write PCM into.
+            out.push_back(f.subslotSize);
+            out.push_back(flagged);
+        }
+    }
+    return out;
+}
+
+bool UsbAudioDriver::hasNativeDsd() const {
+    for (auto& f : formats)
+        if (!f.isCapture && f.isDsd) return true;
+    return false;
+}
+
 bool UsbAudioDriver::configureCapture(int sampleRate, int channels, int bitDepth) {
     if (!opened) {
         LOGE("configureCapture() called but not opened");

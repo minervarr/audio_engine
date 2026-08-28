@@ -45,6 +45,14 @@ target_include_directories(ae_usb PUBLIC
     ${AE_THIRD_PARTY}
     ${AE_THIRD_PARTY}/libusb/libusb)
 target_link_libraries(ae_usb PUBLIC ae_core usb1 Threads::Threads)
+# usb_audio.cpp logs through __android_log_print on Android (see its LOG* macros),
+# so the target that compiles it has to bring liblog with it. Without this, every
+# consumer outside platform/android/'s monolithic build hits undefined references
+# to __android_log_print and has to guess that `log` is the missing piece --
+# Matrix_Player got it from the monolith, AOAS links this target directly.
+if(ANDROID)
+    target_link_libraries(ae_usb PUBLIC log)
+endif()
 # -O3 here is a GCC/Clang spelling. It used to be unguarded, so on Windows MSVC
 # rejected it (D9002 "ignoring unknown option") and the primary USB backend
 # silently built at whatever CMAKE_CXX_FLAGS_<CONFIG> gave it — the opposite of

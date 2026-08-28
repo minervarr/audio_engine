@@ -163,6 +163,25 @@ public:
     std::vector<int> getCaptureFormatTuples() const;
     std::vector<int> getOutputFormatTuples() const;
 
+    // The DSD (RAW_DATA) alt-settings, flattened as
+    // (rate, channels, subslot, flaggedByDescriptor) QUADS. The fourth int is
+    // 1 when the device itself set bmFormats bit 31 and 0 when this driver
+    // GUESSED via the duplicate-alt heuristic below. A consumer must be able
+    // to tell those apart: the first is the device's own claim, the second is
+    // ours, and presenting them identically means either hedging over a fact
+    // or asserting a guess. Separate from getOutputFormatTuples() because a DSD alt-setting
+    // is NOT a PCM format that happens to be exotic: its bBitResolution is a
+    // container width, not a sample depth, and feeding it PCM produces noise
+    // at full scale. A caller must opt in, which is what configure()'s
+    // preferDsd parameter is for.
+    //
+    // Empty means this device advertises no native DSD alt-setting. That is
+    // not the same as "no DSD": DoP carries DSD inside an ordinary PCM stream
+    // (see core/dsp/dsd/dsd_packager.h) and needs nothing from this list.
+    std::vector<int> getDsdFormatTuples() const;
+    // True if any alt-setting was parsed with the RAW_DATA bit set.
+    bool hasNativeDsd() const;
+
     // Latency/stability profile: 0 = LOW_LATENCY, 1 = STABLE (default).
     // Sizes the iso transfer queues and ring buffers for both directions.
     // Takes effect at the next configure()/startCapture(); ignored (logged)
