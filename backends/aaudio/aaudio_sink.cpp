@@ -8,6 +8,21 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "AAudioSink", __VA_ARGS__)
 
 namespace ae {
+namespace {
+
+// AAudio's error callback, on a thread of its own.
+//
+// userData is the sink's `disconnected_` flag rather than the sink itself, so
+// this needs no access to the class and cannot be tempted into touching
+// anything else. Setting a flag is ALL that is permitted here: AAudio
+// explicitly forbids closing or stopping the stream from inside this callback,
+// and the documented pattern is to hand the work to another thread.
+void onStreamError(AAudioStream* /*stream*/, void* userData, aaudio_result_t error) {
+    LOGE("stream error: %s", AAudio_convertResultToText(error));
+    if (userData) static_cast<std::atomic<bool>*>(userData)->store(true);
+}
+
+}  // namespace
 
 AAudioSink::~AAudioSink() { closeStream(); }
 
@@ -26,6 +41,11 @@ bool AAudioSink::configure(const AudioFormat& fmt) {
     AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
     AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_MODE_SHARED);
     AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_NONE);
+    // Without this a disconnect is silent: writes start failing and the
+    // position counters freeze, with nothing anywhere saying why. See
+    // disconnected().
+    disconnected_.store(false);
+    AAudioStreamBuilder_setErrorCallback(b, onStreamError, &disconnected_);
 
     aaudio_result_t r = AAudioStreamBuilder_openStream(b, &stream_);
     AAudioStreamBuilder_delete(b);
@@ -69,7 +89,13 @@ int AAudioSink::write(const uint8_t* data, int len) {
         }
         floatToInt16Dither(f32_.data(), i16_.data(), samples, dither_);
         aaudio_result_t r = AAudioStream_write(stream_, i16_.data(), frames, 100LL * 1000 * 1000);
-        if (r < 0) { LOGE("write failed: %s", AAudio_convertResultToText(r)); return -1; }
+        if (r < 0) {
+            LOGE("write failed: %s", AAudio_convertResultToText(r));
+            // The callback is the reliable signal and this is the immediate
+            // one; whichever arrives first, the consumer sees the same flag.
+            if (r == AAUDIO_ERROR_DISCONNECTED) disconnected_.store(true);
+            return -1;
+        }
         return (int)r * srcFrameBytes;   // report source-domain bytes consumed
     }
 
@@ -80,6 +106,7 @@ int AAudioSink::write(const uint8_t* data, int len) {
     aaudio_result_t r = AAudioStream_write(stream_, data, numFrames, 100LL * 1000 * 1000);
     if (r < 0) {
         LOGE("write failed: %s", AAudio_convertResultToText(r));
+        if (r == AAUDIO_ERROR_DISCONNECTED) disconnected_.store(true);
         return -1;
     }
     return (int)r * frameBytes;

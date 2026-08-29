@@ -1,6 +1,7 @@
 #ifndef AE_BACKENDS_AAUDIO_SINK_H
 #define AE_BACKENDS_AAUDIO_SINK_H
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -72,8 +73,32 @@ public:
     // constant error for a larger varying one.
     bool presentedFrames(int64_t& frames, int64_t& atNanos) const;
 
+    // The stream is gone: the route changed under it.
+    //
+    // Plugging in headphones, connecting Bluetooth, or docking does not
+    // reconfigure an AAudio stream — it DISCONNECTS it. The stream stays open
+    // and useless: writes fail, and the position counters stop advancing while
+    // getTimestamp keeps cheerfully answering with the last reading it had.
+    //
+    // For a music player that is a dropout. For a video player it is worse
+    // than that, because the audio position IS the master clock: it stops
+    // answering, the timeline freezes, and the picture stops with it. Nothing
+    // reports an error anywhere; playback simply halts.
+    //
+    // Set from AAudio's own error callback, which arrives on a thread of its
+    // own, and also from a failed write — the callback is the reliable signal
+    // but the write result is the immediate one. Cleared by configure().
+    //
+    // Recovering is the CONSUMER's job, not this class's: a new stream has to
+    // be opened and the consumer's own timeline re-anchored against it, and
+    // only the consumer knows what it was playing. Do not stop or close the
+    // stream from inside the callback — AAudio forbids it.
+    bool disconnected() const { return disconnected_.load(); }
+
 private:
     void closeStream();
+
+    std::atomic<bool> disconnected_{false};
 
     AAudioStream* stream_ = nullptr;
     AudioFormat   format_{};
