@@ -47,6 +47,31 @@ public:
     // it cannot go backwards no matter when it is read.
     int64_t framesPlayed() const;
 
+    // Total frames handed to the stream so far.
+    //
+    // The anchor a video clock needs. framesPlayed() and presentedFrames()
+    // below count in the same space — frames since the stream started — but
+    // neither says which of them corresponds to a given piece of AUDIO. Read
+    // this immediately BEFORE writing the first buffer of a segment and it
+    // does: that buffer's first sample is frame `framesWritten()`.
+    int64_t framesWritten() const;
+
+    // What the DAC has actually PRESENTED, and the CLOCK_MONOTONIC instant at
+    // which that was true. Returns false when the device cannot say yet, which
+    // it cannot for the first few hundred milliseconds of a stream.
+    //
+    // Different from framesPlayed(), and the difference is the point.
+    // getFramesRead() counts frames the STREAM has consumed from its buffer;
+    // those frames have not reached the speaker yet, and the gap between the
+    // two is the device's output latency — tens of milliseconds on a phone. A
+    // video clock built on framesPlayed() therefore runs that far AHEAD of the
+    // sound, which nobody can see and everybody can feel.
+    //
+    // `atNanos` is not decoration: the reading describes a moment already in
+    // the past, so a consumer that treats `frames` as "now" trades one
+    // constant error for a larger varying one.
+    bool presentedFrames(int64_t& frames, int64_t& atNanos) const;
+
 private:
     void closeStream();
 

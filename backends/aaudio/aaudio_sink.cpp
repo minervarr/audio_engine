@@ -2,6 +2,7 @@
 
 #include <aaudio/AAudio.h>
 #include <android/log.h>
+#include <time.h>
 
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "AAudioSink", __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "AAudioSink", __VA_ARGS__)
@@ -113,6 +114,25 @@ int AAudioSink::pendingPlaybackMs() const {
 int64_t AAudioSink::framesPlayed() const {
     if (!stream_) return 0;
     return AAudioStream_getFramesRead(stream_);
+}
+
+int64_t AAudioSink::framesWritten() const {
+    if (!stream_) return 0;
+    return AAudioStream_getFramesWritten(stream_);
+}
+
+bool AAudioSink::presentedFrames(int64_t& frames, int64_t& atNanos) const {
+    if (!stream_) return false;
+    int64_t pos = 0, nanos = 0;
+    // CLOCK_MONOTONIC, so the answer is comparable with std::chrono's
+    // steady_clock on this platform. The other choice AAudio offers is
+    // CLOCK_BOOTTIME, which keeps counting through suspend and is therefore
+    // the wrong basis for "how long ago was that".
+    if (AAudioStream_getTimestamp(stream_, CLOCK_MONOTONIC, &pos, &nanos) != AAUDIO_OK)
+        return false;
+    frames  = pos;
+    atNanos = nanos;
+    return true;
 }
 
 void AAudioSink::closeStream() {
