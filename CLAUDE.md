@@ -74,10 +74,25 @@ and the decoder seam. Backends implement these; the engine orchestrates them.
      Public contracts in `core/include/core/`, impl in `core/src/`.
    - `api/` — the shipped **C ABI** (`include/audio_engine.h`) + its C++ impl
      (`src/`), wrapping `ae::Engine`.
-   - `backends/` — OS/library-specific IO. `usb/` `alsa/` `jack/` (desktop),
-     `aaudio/` `mediacodec/` (Android), `wasapi/` (Windows, parked), `dsd/`
-     (DFF/DSF + DoP), `flac/` (native FLAC decode + encode via vendored libFLAC),
-     `mp3/` (native MP3 decode via libmpg123 + encode via LAME).
+   - `backends/` — OS/library-specific IO. `usb/` `alsa/` `jack/`
+     `bluetooth/` (desktop), `aaudio/` `mediacodec/` (Android), `wasapi/`
+     (Windows, parked), `dsd/` (DFF/DSF + DoP), `flac/` (native FLAC decode +
+     encode via vendored libFLAC), `mp3/` (native MP3 decode via libmpg123 +
+     encode via LAME).
+     `bluetooth/` is A2DP from the SOURCE side and is the one backend that
+     registers a service on the system: it publishes its own
+     `org.bluez.MediaEndpoint1` over sd-bus, negotiates SBC, encodes with
+     libsbc and writes RTP to the AVDTP socket — rather than handing PCM to a
+     sound server that would resample, mix and attenuate before its own
+     encoder saw it. Gated on `SDBUS_FOUND AND SBC_FOUND`, so a machine
+     without those headers simply has no `ae_bluetooth` target.
+     Its negotiation half (`a2dp_sbc.h/.cpp`) is PURE and stays that way:
+     `a2dp_sbc_test` links that one file and asserts against capability bytes
+     read off real headphones, on any machine, with no library behind it.
+     Consequence worth knowing before debugging it: **one A2DP transport per
+     device**, owned by whoever registered the endpoint BlueZ configured — so
+     PipeWire holding the headphones means we cannot have them, and the
+     backend reports that rather than streaming to nothing.
    - `platform/` — per-platform build systems that need **more than a
      compiler** (currently `android/`, a self-contained Gradle project).
    - `scripts/` — thin build entry points for platforms that need only

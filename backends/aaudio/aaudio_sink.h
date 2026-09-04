@@ -97,6 +97,23 @@ public:
 
 private:
     void closeStream();
+    // Diagnostics for a stream that reports success and consumes nothing.
+    void reportStall(int framesAccepted);
+    // Rebuild the stream after the OS moved the route out from under it.
+    bool reopenAfterDisconnect();
+    // What configure() was ASKED for, which is what a rebuilt stream must be
+    // given again -- not what the previous stream happened to be granted.
+    ae::AudioFormat requested_{};
+    int  starvedWrites_ = 0;
+    // pendingPlaybackMs() is const and this only counts log lines.
+    mutable int overPending_ = 0;
+
+    // Pause the stream and discard everything the device has not rendered yet,
+    // waiting out both asynchronous transitions. Returns false (and logs) if
+    // AAudio refused either step — a silent failure here is what made flush()
+    // a no-op for as long as it existed. Leaves the stream in FLUSHED; the
+    // caller decides whether to re-arm it (flush) or stop it (stop).
+    bool pauseAndDiscard();
 
     std::atomic<bool> disconnected_{false};
 

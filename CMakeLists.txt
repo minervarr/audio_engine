@@ -173,11 +173,21 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_link_libraries(dsp_null_test PRIVATE ae_core)
     target_include_directories(dsp_null_test PRIVATE ${AE_BACKENDS}/usb)
 
+    # A2DP SBC negotiation and RTP framing. Pure -- no adapter, no device, no
+    # Bluetooth of any kind -- and asserted against capability bytes read off
+    # real hardware, which is the only thing that makes a wire-format test worth
+    # anything. Built whenever the backend is, and it needs nothing FROM the
+    # backend's libraries: a2dp_sbc.cpp calls neither sd-bus nor libsbc.
+    add_executable(a2dp_sbc_test
+        ${AE_ROOT}/tests/a2dp_sbc_test.cpp
+        ${AE_BACKENDS}/bluetooth/a2dp_sbc.cpp)
+    target_include_directories(a2dp_sbc_test PRIVATE ${AE_ROOT})
+
     add_executable(dsp_bench ${AE_ROOT}/tests/dsp_bench.cpp)
     target_link_libraries(dsp_bench PRIVATE ae_core)
     target_include_directories(dsp_bench PRIVATE ${AE_BACKENDS}/usb)
 
-    foreach(t dsp_null_test dsp_bench)
+    foreach(t dsp_null_test dsp_bench a2dp_sbc_test)
         if(MSVC)
             target_compile_options(${t} PRIVATE /O2 /fp:precise)
         else()
@@ -241,11 +251,56 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
                         "Install jack2 (NOT pipewire-jack) and reconfigure.")
     endif()
 
+    # Bluetooth A2DP: OUR OWN source endpoint on BlueZ, not a client of a sound
+    # server. Registering the endpoint ourselves is what keeps the samples ours
+    # all the way to the radio -- the same reason ae_usb bypasses the OS mixer.
+    #
+    # Gated exactly as ae_jack is: a machine without sd-bus or libsbc simply
+    # does not get the target, and the consuming app tests `if(TARGET
+    # ae_bluetooth)` rather than assuming. LDAC and aptX are deliberately NOT
+    # required here -- SBC is mandatory in A2DP and is what ships first; the
+    # vendor codecs are additive and gate themselves the same way.
+    if(PkgConfig_FOUND)
+        pkg_check_modules(SDBUS libsystemd)
+        pkg_check_modules(SBC sbc)
+    endif()
+    if(SDBUS_FOUND AND SBC_FOUND)
+        add_library(ae_bluetooth STATIC
+            ${AE_BACKENDS}/bluetooth/a2dp_sbc.cpp
+            ${AE_BACKENDS}/bluetooth/sbc_encoder.cpp
+            ${AE_BACKENDS}/bluetooth/bluez_a2dp.cpp
+            ${AE_BACKENDS}/bluetooth/bluez_endpoint.cpp
+            ${AE_BACKENDS}/bluetooth/bluetooth_sink.cpp)
+        target_include_directories(ae_bluetooth PUBLIC
+            ${AE_BACKENDS}/bluetooth ${SDBUS_INCLUDE_DIRS} ${SBC_INCLUDE_DIRS})
+        target_link_libraries(ae_bluetooth PUBLIC
+            ae_core ${SDBUS_LIBRARIES} ${SBC_LIBRARIES} Threads::Threads)
+    else()
+        message(STATUS "sd-bus (libsystemd) or libsbc not found - skipping ae_bluetooth. "
+                       "Install systemd and sbc development headers to build the "
+                       "Bluetooth A2DP backend.")
+    endif()
+
     # --- smoke-test tools -----------------------------------------------------
     option(AUDIO_ENGINE_BUILD_TOOLS "Build capture/play smoke-test executables" ON)
     if(AUDIO_ENGINE_BUILD_TOOLS)
         add_executable(list_usb_devices    tools/list_usb_devices.cpp)
         target_link_libraries(list_usb_devices ae_usb)
+        # What BlueZ says about the A2DP sinks here, and what we would
+        # negotiate with each. The only way to answer either against a real
+        # adapter and a real pair of headphones.
+        if(TARGET ae_bluetooth)
+            add_executable(list_bluetooth_sinks tools/list_bluetooth_sinks.cpp)
+            target_link_libraries(list_bluetooth_sinks ae_bluetooth)
+            target_include_directories(list_bluetooth_sinks PRIVATE ${AE_ROOT})
+            # The other half of the same question: not what we WOULD negotiate
+            # but what actually comes out of the headphones. The only way to
+            # find out whether owning the endpoint works is to own one.
+            add_executable(play_wav_to_bluetooth tools/play_wav_to_bluetooth.cpp)
+            target_link_libraries(play_wav_to_bluetooth ae_bluetooth)
+            target_include_directories(play_wav_to_bluetooth PRIVATE
+                ${AE_ROOT} ${AE_ROOT}/tools)
+        endif()
         add_executable(capture_usb_to_wav  tools/capture_usb_to_wav.cpp)
         target_link_libraries(capture_usb_to_wav ae_usb)
 
